@@ -1,3 +1,5 @@
+<img src="assets/mappa-mundi.svg" width="88" align="right" alt="">
+
 # Mappa Mundi
 
 An offline desktop app that shows where your photos were taken, like the
@@ -6,6 +8,15 @@ HEIC, JPEG, Live Photos, videos) and it puts them on a world map, grouped into
 thumbnail markers that split apart as you zoom in.
 
 Nothing touches the network: the world map is compiled into the binary.
+
+![A photo library on the world map](docs/screenshots/map.webp)
+
+| Click a place to see its photos | Full-screen viewer with Live Photos, captions and favourites |
+|---|---|
+| ![The photos taken in London](docs/screenshots/places.webp) | ![A Live Photo in the viewer](docs/screenshots/viewer.webp) |
+
+<sub>The screenshots show a demo library of public-domain and CC0 photos from Wikimedia Commons
+([credits](docs/screenshots/CREDITS.md)).</sub>
 
 ## Features
 
@@ -59,6 +70,16 @@ cargo build --release
 
 You can also start it with no arguments and use **Open Folder…**. The folder
 is remembered for next time.
+
+To add it to app launchers (rofi, fuzzel, GNOME, KDE…), install its desktop
+entry and icon. The full path in `Exec` is there because launchers often
+don't have `~/.cargo/bin` on their PATH.
+
+```sh
+install -Dm644 assets/mappa-mundi.svg ~/.local/share/icons/hicolor/scalable/apps/mappa-mundi.svg
+sed "s|^Exec=mappa-mundi|Exec=$HOME/.cargo/bin/mappa-mundi|" assets/mappa-mundi.desktop \
+    > ~/.local/share/applications/mappa-mundi.desktop
+```
 
 ## Controls
 

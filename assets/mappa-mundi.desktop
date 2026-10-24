@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mappa Mundi
+GenericName=Photo Map
+Comment=See where your photos were taken
+Exec=mappa-mundi
+Icon=mappa-mundi
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=photos;pictures;map;places;iphone;heic;gps;
+StartupWMClass=mappa-mundi

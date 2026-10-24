@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- A T-O map, the classic medieval mappa mundi: the world as a disc ringed
+       by Ocean, split by a T of waters into Asia (above; east is at the top),
+       Europe (lower left) and Africa (lower right). The rim is the dungeonOS
+       double rule: bronze line, dark gap, band. -->
+  <circle cx="128" cy="128" r="124" fill="#7E705D"/>
+  <circle cx="128" cy="128" r="120" fill="#141210"/>
+  <circle cx="128" cy="128" r="114" fill="#463D34"/>
+  <circle cx="128" cy="128" r="110" fill="#1A1816"/>
+  <path d="M30,128 A98,98 0 0 1 226,128 Z" fill="#6E7F5A"/>
+  <path d="M128,128 L30,128 A98,98 0 0 0 128,226 Z" fill="#A88A5B"/>
+  <path d="M128,128 L128,226 A98,98 0 0 0 226,128 Z" fill="#7A5E47"/>
+  <rect x="26" y="123" width="204" height="10" fill="#1A1816"/>
+  <rect x="123" y="128" width="10" height="102" fill="#1A1816"/>
+</svg>
