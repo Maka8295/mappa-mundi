@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""Download offline street maps for the places in your photo library.
+
+    street-maps plan [LIBRARY]       show which areas would be downloaded, and how much
+    street-maps download [LIBRARY]   download them (resumable; re-run to add new places)
+
+Street data is OpenStreetMap, from the daily Protomaps planet build
+(https://maps.protomaps.com/builds). Only the tiles around places where your
+photos were taken are fetched, using HTTP range requests, so the 140 GB planet
+file is never downloaded. Mappa Mundi picks the result up automatically from
+~/.local/share/mappa-mundi/streets.pmtiles.
+
+LIBRARY defaults to the folder Mappa Mundi last opened. Photo locations come
+from Mappa Mundi's index, so open the library in the app once first.
+"""
+
+import argparse
+import gzip
+import hashlib
+import json
+import math
+import os
+import struct
+import sys
+import threading
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "mappa-mundi"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "mappa-mundi"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "mappa-mundi" / "config.json"
+OUT = DATA / "streets.pmtiles"
+BUILDS = "https://build-metadata.protomaps.dev/builds.json"
+BUILD_URL = "https://build.protomaps.com/{}"
+UA = {"User-Agent": "mappa-mundi street-maps (https://github.com/Maka8295/mappa-mundi)"}
+
+MIN_ZOOM = 9  # below this the app's built-in map is used
+MAX_ZOOM = 15  # deepest level in the planet build; the app zooms past it
+# How far around each photo to fetch, in km, per zoom level: full street
+# detail close by, wider context at the zoom levels where it costs little.
+RADIUS_KM = {9: 60, 10: 40, 11: 25, 12: 12, 13: 6, 14: 3, 15: 3}
+
+
+def die(msg, code=1):
+    print(f"\n{msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------ PMTiles format
+
+def zxy_to_tileid(z, x, y):
+    """Position along the Hilbert curve, counting every lower zoom level's tiles first."""
+    acc = ((1 << (2 * z)) - 1) // 3
+    n = 1 << z
+    d = 0
+    s = n >> 1
+    while s > 0:
+        rx = 1 if x & s else 0
+        ry = 1 if y & s else 0
+        d += s * s * ((3 * rx) ^ ry)
+        if ry == 0:
+            if rx == 1:
+                x, y = s - 1 - x, s - 1 - y
+            x, y = y, x
+        s >>= 1
+    return acc + d
+
+
+def read_varint(buf, pos):
+    v = shift = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        v |= (b & 0x7F) << shift
+        if b < 0x80:
+            return v, pos
+        shift += 7
+
+
+def write_varint(out, v):
+    while v >= 0x80:
+        out.append((v & 0x7F) | 0x80)
+        v >>= 7
+    out.append(v)
+
+
+HEADER = struct.Struct("<7sB" + "Q" * 11 + "BBBBBB" + "iiii" + "B" + "ii")
+
+
+def parse_header(b):
+    f = HEADER.unpack(b[:127])
+    if f[0] != b"PMTiles" or f[1] != 3:
+        raise ValueError("not a PMTiles v3 archive")
+    keys = ["root_off", "root_len", "meta_off", "meta_len", "leaf_off", "leaf_len", "data_off", "data_len",
+            "addressed", "entries", "contents", "clustered", "int_comp", "tile_comp", "tile_type", "minz", "maxz",
+            "minlon", "minlat", "maxlon", "maxlat", "cz", "clon", "clat"]
+    return dict(zip(keys, f[2:]))
+
+
+def decode_dir(buf):
+    n, pos = read_varint(buf, 0)
+    ids, runs, lens, offs = [], [], [], []
+    last = 0
+    for _ in range(n):
+        d, pos = read_varint(buf, pos)
+        last += d
+        ids.append(last)
+    for _ in range(n):
+        v, pos = read_varint(buf, pos)
+        runs.append(v)
+    for _ in range(n):
+        v, pos = read_varint(buf, pos)
+        lens.append(v)
+    for i in range(n):
+        v, pos = read_varint(buf, pos)
+        offs.append(offs[i - 1] + lens[i - 1] if v == 0 and i > 0 else v - 1)
+    return list(zip(ids, offs, lens, runs))
+
+
+def encode_dir(entries):
+    out = bytearray()
+    write_varint(out, len(entries))
+    last = 0
+    for tid, *_ in entries:
+        write_varint(out, tid - last)
+        last = tid
+    for *_, run in entries:
+        write_varint(out, run)
+    for _, _, length, _ in entries:
+        write_varint(out, length)
+    for i, (_, off, length, _) in enumerate(entries):
+        prev = entries[i - 1] if i else None
+        write_varint(out, 0 if prev and off == prev[1] + prev[2] else off + 1)
+    return gzip.compress(bytes(out), mtime=0)
+
+
+def find(entries, tid):
+    """The directory entry covering tile `tid`, or None."""
+    lo, hi = 0, len(entries) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if entries[mid][0] <= tid:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if hi < 0:
+        return None
+    e = entries[hi]
+    if e[3] == 0 or tid < e[0] + e[3]:
+        return e
+    return None
+
+
+class Remote:
+    """A PMTiles archive read over HTTP with range requests."""
+
+    def __init__(self, url):
+        self.url = url
+        head = self.get(0, 16384)
+        self.h = parse_header(head)
+        self.root = decode_dir(gzip.decompress(head[self.h["root_off"]:self.h["root_off"] + self.h["root_len"]]))
+        self.meta = json.loads(gzip.decompress(self.get(self.h["meta_off"], self.h["meta_len"])))
+        self.leaves = {}
+        self.lock = threading.Lock()
+
+    def get(self, off, length):
+        for attempt in range(6):
+            try:
+                req = urllib.request.Request(self.url, headers={**UA, "Range": f"bytes={off}-{off + length - 1}"})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    data = r.read()
+                if len(data) == length:
+                    return data
+            except Exception as e:  # network hiccup: back off and retry
+                err = e
+            time.sleep(2 * (attempt + 1))
+        die(f"Download keeps failing ({err if 'err' in dir() else 'short read'}). Run the same command again to resume.")
+
+    def leaf(self, off, length):
+        key = (off, length)
+        with self.lock:
+            if key in self.leaves:
+                return self.leaves[key]
+        entries = decode_dir(gzip.decompress(self.get(self.h["leaf_off"] + off, length)))
+        with self.lock:
+            self.leaves[key] = entries
+        return entries
+
+    def locate(self, tid):
+        """(offset, length) of a tile's data, or None if the tile is empty."""
+        entries = self.root
+        for _ in range(4):
+            e = find(entries, tid)
+            if e is None:
+                return None
+            if e[3] > 0:
+                return e[1], e[2]
+            entries = self.leaf(e[1], e[2])
+        return None
+
+
+class Local:
+    """An existing extract, so a re-run only downloads what's new."""
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        self.h = parse_header(self.f.read(16384))
+        self.f.seek(self.h["root_off"])
+        root = decode_dir(gzip.decompress(self.f.read(self.h["root_len"])))
+        self.tiles = {}
+        for tid, off, length, run in root:
+            if run == 0:
+                self.f.seek(self.h["leaf_off"] + off)
+                for t2, o2, l2, r2 in decode_dir(gzip.decompress(self.f.read(length))):
+                    for k in range(r2):
+                        self.tiles[t2 + k] = (o2, l2)
+            else:
+                for k in range(run):
+                    self.tiles[tid + k] = (off, length)
+
+    def read(self, tid):
+        off, length = self.tiles[tid]
+        self.f.seek(self.h["data_off"] + off)
+        return self.f.read(length)
+
+
+def write_archive(path, tiles, meta, bounds):
+    """Writes {tileid: bytes} as a clustered PMTiles v3 archive."""
+    ids = sorted(tiles)
+    data = bytearray()
+    seen = {}
+    entries = []
+    for tid in ids:
+        blob = tiles[tid]
+        h = hashlib.sha1(blob).digest()
+        if h in seen:
+            off = seen[h]
+        else:
+            off = len(data)
+            seen[h] = off
+            data += blob
+        last = entries[-1] if entries else None
+        if last and last[0] + last[3] == tid and last[1] == off:
+            entries[-1] = (last[0], last[1], last[2], last[3] + 1)
+        else:
+            entries.append((tid, off, len(blob), 1))
+
+    # The root directory has to fit in the first 16 KiB with the header;
+    # bigger directories are split into leaves.
+    root = encode_dir(entries)
+    leaves = b""
+    leaf_size = 4096
+    while len(root) > 16384 - 127:
+        leaf_parts, root_entries = bytearray(), []
+        for i in range(0, len(entries), leaf_size):
+            chunk = encode_dir(entries[i:i + leaf_size])
+            root_entries.append((entries[i][0], len(leaf_parts), len(chunk), 0))
+            leaf_parts += chunk
+        root, leaves = encode_dir(root_entries), bytes(leaf_parts)
+        leaf_size *= 2
+
+    meta_bytes = gzip.compress(json.dumps(meta).encode(), mtime=0)
+    root_off = 127
+    meta_off = root_off + len(root)
+    leaf_off = meta_off + len(meta_bytes)
+    data_off = leaf_off + len(leaves)
+    zooms = [tileid_zoom(t) for t in ids] or [MIN_ZOOM]
+    (minlon, minlat, maxlon, maxlat) = bounds
+    header = HEADER.pack(b"PMTiles", 3, root_off, len(root), meta_off, len(meta_bytes), leaf_off, len(leaves),
+                         data_off, len(data), sum(e[3] for e in entries), len(entries), len(seen),
+                         1, 2, 2, 1, min(zooms), max(zooms),
+                         int(minlon * 1e7), int(minlat * 1e7), int(maxlon * 1e7), int(maxlat * 1e7),
+                         max(zooms), int((minlon + maxlon) / 2 * 1e7), int((minlat + maxlat) / 2 * 1e7))
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        f.write(header + root + meta_bytes + leaves + data)
+    os.replace(tmp, path)
+
+
+def tileid_zoom(tid):
+    z = 0
+    while tid >= ((1 << (2 * (z + 1))) - 1) // 3:
+        z += 1
+    return z
+
+
+# ------------------------------------------------------------ which tiles
+
+def photo_locations(library):
+    """(lat, lon) of every photo, from Mappa Mundi's index of `library`."""
+    root = str(Path(library).expanduser().resolve())
+    for idx in (CACHE / "index").glob("*.json"):
+        try:
+            entries = json.loads(idx.read_text())["entries"]
+        except (OSError, ValueError, KeyError):
+            continue
+        if not entries or not next(iter(entries)).startswith(root + os.sep):
+            continue
+        pts = {(round(m["meta"]["lat"], 3), round(m["meta"]["lon"], 3))
+               for m in entries.values() if m["meta"].get("lat") is not None}
+        return sorted(pts)
+    die(f"Mappa Mundi hasn't indexed {root} yet. Open it in the app once (mappa-mundi {root}), then run this again.")
+
+
+def tiles_for(points, radius):
+    """Tile ids to fetch: everything near a photo, per zoom. `radius` (km)
+    scales the full-detail area; RADIUS_KM is the default of 3 km."""
+    wanted = set()
+    for z in range(MIN_ZOOM, MAX_ZOOM + 1):
+        n = 1 << z
+        r = RADIUS_KM[z] * radius / RADIUS_KM[MAX_ZOOM]
+        for lat, lon in points:
+            dlat = r / 111.0
+            dlon = r / (111.0 * max(math.cos(math.radians(lat)), 0.05))
+            x0, y1 = lonlat_tile(lon - dlon, lat - dlat, n)
+            x1, y0 = lonlat_tile(lon + dlon, lat + dlat, n)
+            for x in range(x0, x1 + 1):
+                for y in range(max(y0, 0), min(y1, n - 1) + 1):
+                    wanted.add(zxy_to_tileid(z, x % n, y))
+    return wanted
+
+
+def lonlat_tile(lon, lat, n):
+    lat = max(min(lat, 85.0511), -85.0511)
+    x = int((lon + 180) / 360 * n)
+    y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
+    return x, y
+
+
+def latest_build():
+    req = urllib.request.Request(BUILDS, headers=UA)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        builds = json.load(r)
+    return max(builds, key=lambda b: b["key"])
+
+
+def library_arg(args):
+    if args.library:
+        return args.library
+    try:
+        root = json.loads(CONFIG.read_text()).get("root")
+    except (OSError, ValueError):
+        root = None
+    if not root:
+        die("Which photo library? Pass its folder, e.g.  street-maps plan ~/ssd/icloud-photos")
+    return root
+
+
+# ------------------------------------------------------------ commands
+
+def cmd_plan(args):
+    points = photo_locations(library_arg(args))
+    wanted = tiles_for(points, args.radius)
+    have = Local(args.out).tiles.keys() if args.out.exists() else set()
+    new = len(wanted - set(have))
+    print(f"{len(points):,} distinct photo locations")
+    print(f"{len(wanted):,} map tiles cover them ({new:,} not downloaded yet)")
+    # City-centre street tiles average about 60 KB compressed; suburbs and
+    # countryside much less, so this errs high.
+    print(f"Estimated size: up to {len(wanted) * 60 / 1e6:.1f} GB  →  {args.out}")
+
+
+def cmd_download(args):
+    library = library_arg(args)
+    points = photo_locations(library)
+    wanted = tiles_for(points, args.radius)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    local = Local(args.out) if args.out.exists() else None
+    partial = args.out.with_suffix(".partial")
+    part_index = args.out.with_suffix(".partial.json")
+    done = json.loads(part_index.read_text()) if part_index.exists() and partial.exists() else {}
+    done = {int(k): v for k, v in done.items()}
+
+    todo = [t for t in wanted if not (local and t in local.tiles) and t not in done]
+    build = latest_build()
+    print(f"{len(points):,} photo locations → {len(wanted):,} tiles; {len(todo):,} to download "
+          f"from OpenStreetMap build {build['key'].removesuffix('.pmtiles')}")
+    remote = Remote(BUILD_URL.format(build["key"]))
+
+    # Find every tile's bytes in the planet file (loading directory leaves as needed).
+    with ThreadPoolExecutor(16) as pool:
+        located = list(pool.map(lambda t: (t, remote.locate(t)), todo))
+    present = [(t, loc) for t, loc in located if loc]
+    empty = len(located) - len(present)
+
+    # Tiles near each other on the Hilbert curve sit near each other in the
+    # file: fetch them in merged ranges.
+    present.sort(key=lambda p: p[1][0])
+    batches, cur = [], []
+    for t, (off, length) in present:
+        if cur and (off - (cur[-1][1][0] + cur[-1][1][1]) > 64 * 1024 or off + length - cur[0][1][0] > 8 << 20):
+            batches.append(cur)
+            cur = []
+        cur.append((t, (off, length)))
+    if cur:
+        batches.append(cur)
+
+    lock = threading.Lock()
+    total_bytes = sum(loc[1] for _, loc in present)
+    got = [0]
+    start = time.monotonic()
+    with open(partial, "ab") as pf:
+
+        def fetch(batch):
+            first = batch[0][1][0]
+            last = batch[-1][1][0] + batch[-1][1][1]
+            blob = remote.get(remote.h["data_off"] + first, last - first)
+            with lock:
+                for t, (off, length) in batch:
+                    pos = pf.seek(0, os.SEEK_END)
+                    pf.write(blob[off - first:off - first + length])
+                    done[t] = [pos, length]
+                    got[0] += length
+                pf.flush()
+                part_index.write_text(json.dumps(done))
+                rate = got[0] / max(time.monotonic() - start, 0.1) / 1e6
+                print(f"\r  {got[0] / 1e6:,.0f} / {total_bytes / 1e6:,.0f} MB  ({rate:.1f} MB/s)   ", end="", flush=True)
+
+        with ThreadPoolExecutor(8) as pool:
+            list(pool.map(fetch, batches))
+    print()
+
+    # Assemble the new archive from the old one plus everything fetched.
+    tiles = {}
+    if local:
+        for t in local.tiles:
+            tiles[t] = local.read(t)
+    with open(partial, "rb") as pf:
+        for t, (pos, length) in done.items():
+            pf.seek(pos)
+            tiles[t] = pf.read(length)
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    meta = dict(remote.meta)
+    meta.pop("vector_layers", None)
+    meta["description"] = f"Street maps around the photos in {library}"
+    write_archive(args.out, tiles, meta, (min(lons) - 1, min(lats) - 1, max(lons) + 1, max(lats) + 1))
+    partial.unlink(missing_ok=True)
+    part_index.unlink(missing_ok=True)
+    size = args.out.stat().st_size
+    print(f"Done: {len(tiles):,} tiles, {size / 1e6:,.0f} MB in {args.out}"
+          + (f" ({empty:,} had no map data)" if empty else ""))
+    print("Mappa Mundi uses it automatically; restart the app if it's open.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command", required=True)
+    for name, func, help in [("plan", cmd_plan, "show what would be downloaded"),
+                             ("download", cmd_download, "download street maps for your photo locations")]:
+        p = sub.add_parser(name, help=help)
+        p.add_argument("library", nargs="?", help="photo library folder (default: the one Mappa Mundi has open)")
+        p.add_argument("--out", type=Path, default=OUT, help=f"output file (default {OUT})")
+        p.add_argument("--radius", type=float, default=RADIUS_KM[MAX_ZOOM],
+                       help=f"km of full street detail around each photo (default {RADIUS_KM[MAX_ZOOM]})")
+        p.set_defaults(func=func)
+    args = ap.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        die("Interrupted. Run the same command again to continue.", 130)
+
+
+if __name__ == "__main__":
+    main()

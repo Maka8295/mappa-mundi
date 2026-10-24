@@ -3,6 +3,12 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect, Response, Ui, Vec2, pos2, vec2};
 
 use crate::tiles::{TileKey, TileLayer};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use egui::epaint::TextShape;
+
+use crate::streets::{Labels, PlaceLabel};
 use crate::{basemap, theme};
 
 pub const MAX_ZOOM: f64 = 20.0;
@@ -225,16 +231,17 @@ impl MapView {
         ui.painter().hline(base.x..=base.x + size.x, base.y + size.y, (1.0, theme::BAND));
     }
 
-    /// Draws one tile layer. Missing tiles are requested and, meanwhile,
-    /// stood in for by a scaled-up ancestor when one is loaded.
-    pub fn draw_tiles(&self, ui: &Ui, rect: Rect, layer: &mut TileLayer) {
-        if self.view.zoom < layer.min_zoom as f64 - 0.5 {
-            return;
-        }
+    /// Edge length of `layer`'s tiles in pixels: they follow the display's
+    /// density when the layer is drawn by the app (0 for fixed raster tiles).
+    fn tile_px(ui: &Ui, layer: &TileLayer) -> u32 {
         let ppp = ui.ctx().pixels_per_point();
-        let px = if layer.scalable { if ppp > 1.25 { 512 } else { 256 } } else { 0 };
-        let zt = (self.view.zoom.round() as i64).clamp(layer.min_zoom as i64, layer.max_zoom as i64) as u8;
-        let n = 1i64 << zt;
+        if layer.scalable { if ppp > 1.25 { 512 } else { 256 } } else { 0 }
+    }
+
+    /// The tiles of zoom level `z` covering `rect`: (x unwrapped, y), plus
+    /// the screen position of tile (0, 0) and the tile size in points.
+    fn visible_tiles(&self, rect: Rect, z: u8) -> (impl Iterator<Item = (i64, i64)>, f64, f64, f64) {
+        let n = 1i64 << z;
         let world = self.world();
         let tile = world / n as f64;
         let left = self.view.cx * world - rect.width() as f64 / 2.0;
@@ -242,13 +249,27 @@ impl MapView {
         let (tx0, tx1) = ((left / tile).floor() as i64, ((left + rect.width() as f64) / tile).floor() as i64);
         let ty0 = ((top / tile).floor() as i64).max(0);
         let ty1 = (((top + rect.height() as f64) / tile).floor() as i64).min(n - 1);
+        let tiles = (ty0..=ty1).flat_map(move |ty| (tx0..=tx1).map(move |tx| (tx, ty)));
+        (tiles, left, top, tile)
+    }
+
+    /// Draws one tile layer. Missing tiles are requested and, meanwhile,
+    /// stood in for by a scaled-up ancestor when one is loaded.
+    pub fn draw_tiles(&self, ui: &Ui, rect: Rect, layer: &mut TileLayer) {
+        if self.view.zoom < layer.min_zoom as f64 - 0.5 {
+            return;
+        }
+        let px = Self::tile_px(ui, layer);
+        let zt = (self.view.zoom.round() as i64).clamp(layer.min_zoom as i64, layer.max_zoom as i64) as u8;
+        let n = 1i64 << zt;
+        let (tiles, left, top, tile) = self.visible_tiles(rect, zt);
         let centre = ((left + rect.width() as f64 / 2.0) / tile, (top + rect.height() as f64 / 2.0) / tile);
 
         let painter = ui.painter_at(rect);
         let full = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-        for ty in ty0..=ty1 {
-            for txi in tx0..=tx1 {
-                let x = txi.rem_euclid(n) as u32;
+        for (txi, ty) in tiles {
+            let x = txi.rem_euclid(n) as u32;
+            {
                 let min =
                     pos2(rect.left() + (txi as f64 * tile - left) as f32, rect.top() + (ty as f64 * tile - top) as f32);
                 let max = pos2(
@@ -259,6 +280,11 @@ impl MapView {
                 let key = TileKey { z: zt, x, y: ty as u32, px };
                 if let Some(tex) = layer.cache.get(&key) {
                     painter.image(tex.id(), screen, full, Color32::WHITE);
+                    continue;
+                }
+                if layer.cache.failed(&key) {
+                    // Not in this layer (e.g. outside a street-map extract):
+                    // leave the map underneath showing rather than a stretched parent.
                     continue;
                 }
                 let dist = ((txi as f64 + 0.5 - centre.0).powi(2) + (ty as f64 + 0.5 - centre.1).powi(2)) as f32;
@@ -280,23 +306,47 @@ impl MapView {
 
     /// Whether `layer` has a loaded tile covering world point (x, y) at the
     /// current zoom.
-    pub fn covered_by(&self, layer: &TileLayer, x: f64, y: f64) -> bool {
+    pub fn covered_by(&self, ui: &Ui, layer: &TileLayer, x: f64, y: f64) -> bool {
         if self.view.zoom < layer.min_zoom as f64 - 0.5 {
             return false;
         }
         let zt = (self.view.zoom.round() as i64).clamp(layer.min_zoom as i64, layer.max_zoom as i64) as u8;
         let n = (1u64 << zt) as f64;
-        let key = TileKey { z: zt, x: (x.rem_euclid(1.0) * n) as u32, y: (y * n).min(n - 1.0) as u32, px: 0 };
-        layer.cache.contains(&key)
+        let (x, y) = ((x.rem_euclid(1.0) * n) as u32, (y * n).min(n - 1.0) as u32);
+        layer.cache.contains(&TileKey { z: zt, x, y, px: Self::tile_px(ui, layer) })
     }
 
-    /// Country and city names from the built-in basemap.
-    /// Labels avoid `obstacles` (photo markers) and each other.
-    pub fn draw_labels(&self, ui: &Ui, rect: Rect, obstacles: &[Rect], hide: impl Fn(f64, f64) -> bool) {
+    /// Place and street names decoded from the street-map tiles in view.
+    pub fn street_labels(&self, rect: Rect, layer: &mut TileLayer) -> Vec<Arc<Labels>> {
+        let min_zoom = layer.min_zoom;
+        let Some(labels) = &mut layer.labels else { return Vec::new() };
+        if self.view.zoom < min_zoom as f64 - 0.5 {
+            return Vec::new();
+        }
+        let dz = (self.view.zoom.round() as i64).clamp(min_zoom as i64, labels.data_max_zoom as i64) as u8;
+        let n = 1i64 << dz;
+        let (tiles, ..) = self.visible_tiles(rect, dz);
+        tiles.filter_map(|(tx, ty)| labels.get(&(dz, tx.rem_euclid(n) as u32, ty as u32))).collect()
+    }
+
+    /// Street, place, city and country names. Labels avoid `obstacles`
+    /// (photo markers) and each other; `hide` suppresses built-in city names
+    /// where a more detailed layer covers them.
+    pub fn draw_labels(
+        &self,
+        ui: &Ui,
+        rect: Rect,
+        obstacles: &[Rect],
+        streets: &[Arc<Labels>],
+        hide: impl Fn(f64, f64) -> bool,
+    ) {
         let painter = ui.painter_at(rect);
         let zoom = self.view.zoom as f32;
         let mut placed: Vec<Rect> = obstacles.to_vec();
         let halo = theme::BG_DARK.gamma_multiply(0.85);
+        if zoom >= 15.0 {
+            self.draw_street_names(&painter, rect, streets, &mut placed, halo);
+        }
 
         let mut put = |text: String, pos: Pos2, font: FontId, color: Color32, dot: bool| -> bool {
             let galley = painter.layout_no_wrap(text, font, color);
@@ -318,6 +368,26 @@ impl MapView {
             }
             true
         };
+
+        // Towns and neighbourhoods from the street maps.
+        let mut seen = HashSet::new();
+        let mut places: Vec<&PlaceLabel> =
+            streets.iter().flat_map(|l| &l.places).filter(|p| p.min_zoom <= zoom).collect();
+        // Towns first, then the neighbourhoods that matter at wider zooms;
+        // dense cities have far more neighbourhoods than fit legibly.
+        places.sort_by(|a, b| b.major.cmp(&a.major).then(a.min_zoom.total_cmp(&b.min_zoom)));
+        let mut minor = 0;
+        for p in places {
+            if !seen.insert(&p.name) {
+                continue;
+            }
+            let pos = self.project(rect, p.x, p.y);
+            if p.major {
+                put(p.name.clone(), pos, theme::blackletter(19.0), theme::FG, false);
+            } else if minor < 24 && put(p.name.to_uppercase(), pos, FontId::proportional(10.5), theme::MUTED, false) {
+                minor += 1;
+            }
+        }
 
         let map = basemap::get();
         let mut n = 0;
@@ -355,4 +425,83 @@ impl MapView {
             }
         }
     }
+
+    /// Writes each street's name along the longest straight stretch of it
+    /// that's on screen, turned to follow the street.
+    fn draw_street_names(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        streets: &[Arc<Labels>],
+        placed: &mut Vec<Rect>,
+        halo: Color32,
+    ) {
+        let mut best: HashMap<&str, (f32, Pos2, Pos2, u8)> = HashMap::new();
+        for labels in streets {
+            for road in &labels.roads {
+                let pts: Vec<Pos2> = road.points.iter().map(|p| self.project(rect, p[0], p[1])).collect();
+                for w in pts.windows(2) {
+                    let Some((a, b)) = clip_to_rect(w[0], w[1], rect.shrink(4.0)) else { continue };
+                    let len = a.distance(b);
+                    let e = best.entry(road.name.as_str()).or_insert((0.0, a, b, road.rank));
+                    if len > e.0 {
+                        *e = (len, a, b, road.rank);
+                    }
+                }
+            }
+        }
+        let mut candidates: Vec<_> = best.into_iter().collect();
+        candidates.sort_by(|x, y| y.1.3.cmp(&x.1.3).then(y.1.0.total_cmp(&x.1.0)));
+        let text = Color32::from_rgb(0xB8, 0xA9, 0x91);
+        for (name, (len, mut a, mut b, rank)) in candidates.into_iter().take(200) {
+            let font = FontId::proportional(if rank >= 3 { 12.0 } else { 11.0 });
+            let galley = painter.layout_no_wrap(name.to_string(), font, text);
+            let size = galley.size();
+            if len < size.x + 16.0 {
+                continue;
+            }
+            // Keep the text the right way up.
+            if b.x < a.x {
+                std::mem::swap(&mut a, &mut b);
+            }
+            let angle = (b.y - a.y).atan2(b.x - a.x);
+            let centre = a + (b - a) / 2.0;
+            let (c, s) = (angle.cos().abs(), angle.sin().abs());
+            let bounds = Rect::from_center_size(centre, vec2(size.x * c + size.y * s, size.x * s + size.y * c));
+            if placed.iter().any(|p| p.intersects(bounds.expand(3.0))) {
+                continue;
+            }
+            placed.push(bounds.expand(3.0));
+            let pos = centre - size / 2.0;
+            for d in [vec2(-1.0, 0.0), vec2(1.0, 0.0), vec2(0.0, -1.0), vec2(0.0, 1.0)] {
+                let shadow = TextShape::new(pos + d, galley.clone(), halo).with_override_text_color(halo);
+                painter.add(shadow.with_angle_and_anchor(angle, Align2::CENTER_CENTER));
+            }
+            painter.add(TextShape::new(pos, galley, text).with_angle_and_anchor(angle, Align2::CENTER_CENTER));
+        }
+    }
+}
+
+/// The part of segment a–b inside `r` (Liang–Barsky).
+fn clip_to_rect(a: Pos2, b: Pos2, r: Rect) -> Option<(Pos2, Pos2)> {
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for (p, q) in [(-d.x, a.x - r.left()), (d.x, r.right() - a.x), (-d.y, a.y - r.top()), (d.y, r.bottom() - a.y)] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+            if t0 > t1 {
+                return None;
+            }
+        }
+    }
+    Some((a + d * t0, a + d * t1))
 }

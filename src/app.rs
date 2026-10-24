@@ -73,6 +73,13 @@ pub struct MappaMundiApp {
     map: MapView,
     fit_on_load: bool,
     basemap: TileLayer,
+    /// OpenStreetMap street maps (tools/street-maps).
+    streets: Option<TileLayer>,
+    /// The street-map file, and its modification time when last loaded:
+    /// a new download is picked up without restarting.
+    streets_path: PathBuf,
+    streets_mtime: Option<std::time::SystemTime>,
+    streets_checked: f64,
     overlay: Option<TileLayer>,
     media: Media,
     selection: Option<Selection>,
@@ -92,14 +99,18 @@ impl MappaMundiApp {
             config.tiles = opts.tiles;
         }
         let mut message = None;
-        let overlay = config.tiles.as_ref().and_then(|p| match TileLayer::open(p, ctx) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                message = Some(format!("Could not open map tiles: {e}"));
-                None
-            }
+        // A .pmtiles passed with --tiles replaces the default street maps;
+        // anything else is a raster overlay.
+        let custom_streets = config.tiles.as_ref().filter(|p| p.extension().is_some_and(|e| e == "pmtiles"));
+        let streets_path = custom_streets.cloned().unwrap_or_else(streets_file);
+        let streets = streets_path
+            .exists()
+            .then(|| TileLayer::streets(&streets_path, ctx))
+            .and_then(|r| r.map_err(|e| message = Some(format!("Could not open street maps: {e}"))).ok());
+        let overlay = config.tiles.as_ref().filter(|_| custom_streets.is_none()).and_then(|p| {
+            TileLayer::open(p, ctx).map_err(|e| message = Some(format!("Could not open map tiles: {e}"))).ok()
         });
-        if overlay.is_none() {
+        if overlay.is_none() && custom_streets.is_none() || custom_streets.is_some() && streets.is_none() {
             // Don't keep complaining about the same file on every launch.
             config.tiles = None;
         }
@@ -113,6 +124,10 @@ impl MappaMundiApp {
             progress: (0, 0),
             message,
             basemap: TileLayer::basemap(ctx),
+            streets,
+            streets_mtime: mtime(&streets_path),
+            streets_path,
+            streets_checked: 0.0,
             overlay,
             media: Media::new(ctx),
             selection: None,
@@ -190,6 +205,29 @@ impl MappaMundiApp {
                 self.start_scan(root, ui.ctx());
             }
         }
+    }
+
+    /// Loads street maps that `street-maps download` (re)wrote while the app
+    /// was open.
+    fn watch_streets(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if now - self.streets_checked < 3.0 {
+            return;
+        }
+        self.streets_checked = now;
+        let current = mtime(&self.streets_path);
+        if current == self.streets_mtime {
+            return;
+        }
+        self.streets_mtime = current;
+        self.streets = match current.map(|_| TileLayer::streets(&self.streets_path, ctx)) {
+            Some(Ok(layer)) => Some(layer),
+            Some(Err(e)) => {
+                self.message = Some(format!("Could not open street maps: {e}"));
+                None
+            }
+            None => None,
+        };
     }
 
     fn choose_folder(&mut self, ctx: &egui::Context) {
@@ -305,6 +343,9 @@ impl MappaMundiApp {
         }
 
         self.map.draw_tiles(ui, rect, &mut self.basemap);
+        if let Some(streets) = &mut self.streets {
+            self.map.draw_tiles(ui, rect, streets);
+        }
         if let Some(overlay) = &mut self.overlay {
             self.map.draw_tiles(ui, rect, overlay);
         }
@@ -312,9 +353,13 @@ impl MappaMundiApp {
         // Recompute after input so markers track the map exactly.
         let markers = self.visible_markers(rect);
         let obstacles: Vec<Rect> = markers.iter().map(|m| m.rect.expand(4.0)).collect();
-        let overlay = self.overlay.as_ref();
-        let map = &self.map;
-        map.draw_labels(ui, rect, &obstacles, |x, y| overlay.is_some_and(|o| map.covered_by(o, x, y)));
+        let street_labels = match &mut self.streets {
+            Some(s) => self.map.street_labels(rect, s),
+            None => Vec::new(),
+        };
+        let (overlay, streets, map) = (self.overlay.as_ref(), self.streets.as_ref(), &self.map);
+        let covered = |x, y| [overlay, streets].into_iter().flatten().any(|l| map.covered_by(ui, l, x, y));
+        map.draw_labels(ui, rect, &obstacles, &street_labels, covered);
 
         let hovered =
             pointer.and_then(|p| markers.iter().rev().find(|m| m.rect.expand(3.0).contains(p)).map(|m| m.cluster));
@@ -331,8 +376,10 @@ impl MappaMundiApp {
 
         self.map.zoom_buttons(ui, rect);
         let mut attribution = "Map: Natural Earth".to_string();
-        if let Some(o) = self.overlay.as_ref().filter(|o| !o.attribution.is_empty()) {
-            attribution = format!("{}  ·  {attribution}", o.attribution);
+        for layer in [&self.streets, &self.overlay].into_iter().flatten() {
+            if !layer.attribution.is_empty() {
+                attribution = format!("{}  ·  {attribution}", layer.attribution);
+            }
         }
         let galley = painter.layout_no_wrap(attribution, FontId::proportional(10.5), theme::COMMENT);
         let r = Rect::from_min_size(rect.right_bottom() - galley.size() - vec2(10.0, 6.0), galley.size())
@@ -616,6 +663,15 @@ fn play_icon(painter: &egui::Painter, centre: Pos2, r: f32, color: Color32) {
     painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
 }
 
+fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Where tools/street-maps saves the street maps.
+fn streets_file() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("mappa-mundi").join("streets.pmtiles")
+}
+
 /// Bounding box (normalised Mercator) of some items.
 fn bounds<'a>(items: impl Iterator<Item = &'a Item>) -> Option<(f64, f64, f64, f64)> {
     items.fold(None, |b, it| {
@@ -692,11 +748,12 @@ impl eframe::App for MappaMundiApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.media.begin_frame(&ctx);
-        self.basemap.cache.begin_frame(&ctx);
-        if let Some(o) = &mut self.overlay {
-            o.cache.begin_frame(&ctx);
+        for layer in [Some(&mut self.basemap), self.streets.as_mut(), self.overlay.as_mut()].into_iter().flatten() {
+            layer.begin_frame(&ctx);
         }
         self.poll_background(ui);
+        self.watch_streets(&ctx);
+        ctx.request_repaint_after(std::time::Duration::from_secs(3));
 
         if let (Some(viewer), Some(lib)) = (&mut self.viewer, &self.library) {
             let mut action = viewer::Action::None;
@@ -727,9 +784,8 @@ impl eframe::App for MappaMundiApp {
         }
 
         self.media.end_frame();
-        self.basemap.cache.end_frame();
-        if let Some(o) = &mut self.overlay {
-            o.cache.end_frame();
+        for layer in [Some(&mut self.basemap), self.streets.as_mut(), self.overlay.as_mut()].into_iter().flatten() {
+            layer.cache.end_frame();
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {

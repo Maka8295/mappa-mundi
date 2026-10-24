@@ -21,7 +21,7 @@ const ROAD: u8 = 6;
 
 // dungeonOS stone: dark water, warm stone land, bronze borders, brass roads.
 pub const OCEAN: [u8; 3] = [0x14, 0x12, 0x10];
-const LAND_RGB: [u8; 3] = [0x2B, 0x26, 0x21];
+pub(crate) const LAND_RGB: [u8; 3] = [0x2B, 0x26, 0x21];
 const URBAN_RGB: [u8; 3] = [0x36, 0x2F, 0x28];
 const RIVER_RGB: [u8; 3] = [0x19, 0x17, 0x14];
 const STATE_RGB: [u8; 3] = [0x46, 0x3D, 0x34];
@@ -388,7 +388,7 @@ fn paint(rgb: [u8; 3]) -> Paint<'static> {
 }
 
 /// Sutherland–Hodgman clip of a ring against the square [lo, hi]².
-fn clip_ring(mut pts: Vec<(f64, f64)>, (lo, hi): (f64, f64)) -> Vec<(f64, f64)> {
+pub(crate) fn clip_ring(mut pts: Vec<(f64, f64)>, (lo, hi): (f64, f64)) -> Vec<(f64, f64)> {
     let inside_all = pts.iter().all(|p| p.0 >= lo && p.0 <= hi && p.1 >= lo && p.1 <= hi);
     if inside_all {
         return pts;
@@ -418,7 +418,7 @@ fn clip_ring(mut pts: Vec<(f64, f64)>, (lo, hi): (f64, f64)) -> Vec<(f64, f64)> 
 }
 
 /// Liang–Barsky clip of a segment against the square [lo, hi]².
-fn clip_segment(a: (f64, f64), b: (f64, f64), (lo, hi): (f64, f64)) -> Option<((f64, f64), (f64, f64))> {
+pub(crate) fn clip_segment(a: (f64, f64), b: (f64, f64), (lo, hi): (f64, f64)) -> Option<((f64, f64), (f64, f64))> {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let (mut t0, mut t1) = (0.0f64, 1.0f64);
     for (p, q) in [(-dx, a.0 - lo), (dx, hi - a.0), (-dy, a.1 - lo), (dy, hi - a.1)] {

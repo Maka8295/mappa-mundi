@@ -7,16 +7,16 @@ Places map in iPhone Photos. Point it at a folder of photos (full-resolution
 HEIC, JPEG, Live Photos, videos) and it puts them on a world map, grouped into
 thumbnail markers that split apart as you zoom in.
 
-Nothing touches the network: the world map is compiled into the binary.
+Nothing touches the network: the world map is compiled into the binary, and
+street maps for the places you've been are downloaded once, ahead of time.
 
-![A photo library on the world map](docs/screenshots/map.webp)
+![Photos from a trip to Venice on the offline street map](docs/screenshots/map.webp)
 
-| Click a place to see its photos | Full-screen viewer with Live Photos, captions and favourites |
+| Click a place to see its photos | Full-screen viewer with Live Photos |
 |---|---|
-| ![The photos taken in London](docs/screenshots/places.webp) | ![A Live Photo in the viewer](docs/screenshots/viewer.webp) |
+| ![The photos taken around St Mark's Square](docs/screenshots/places.webp) | ![A Live Photo of Santa Maria della Salute in the viewer](docs/screenshots/viewer.webp) |
 
-<sub>The screenshots show a demo library of public-domain and CC0 photos from Wikimedia Commons
-([credits](docs/screenshots/CREDITS.md)).</sub>
+<sub>Photos: the author's iPhone 11 library. Map data © OpenStreetMap contributors and Natural Earth.</sub>
 
 ## Features
 
@@ -39,6 +39,10 @@ Nothing touches the network: the world map is compiled into the binary.
   XMP sidecars (`IMG_1234.HEIC.xmp`) override the file's location and date,
   so places you added or fixed in Photos are used. Their captions and
   favourites (♥) appear in the viewer.
+- **Street maps:** download OpenStreetMap detail for just the areas around
+  your photos (usually well under 1 GB), then zoom in to individual streets,
+  buildings, parks and paths, with street names written along the streets.
+  See below.
 - **Offline place names:** "Dublin, Ireland", "London, Paris & 2 more".
 - **[dungeonOS](https://github.com/Maka8295/Dotfiles) look:** the
   stone-and-bronze palette, CloisterBlack headings and
@@ -178,24 +182,55 @@ The wrapper also handles icloudpd 1.32.3's known problems:
 are fixed on purpose: changing them later makes icloudpd download everything
 again under new names. Logs are in `<library>/.icloud-photos-logs/`.
 
-## Street-level offline maps (optional)
+## Street maps
 
-The built-in map comes from [Natural Earth](https://www.naturalearthdata.com/)
-data (1:10m): coastlines, borders, states, rivers, lakes, major roads, urban
-areas and city names. That's good down to roughly city level. For street
-detail, point the app at raster tiles you have locally:
+The built-in world map comes from [Natural Earth](https://www.naturalearthdata.com/)
+(1:10m), which is good down to roughly city level. For street detail,
+`tools/street-maps` downloads [OpenStreetMap](https://www.openstreetmap.org/)
+data for the areas around your photos. It uses the daily
+[Protomaps](https://protomaps.com/) planet build, but reads only the tiles it
+needs from the 140 GB file, using HTTP range requests.
 
 ```sh
-mappa-mundi ~/Pictures/iPhone --tiles ~/maps/region.mbtiles   # raster MBTiles (png/jpg/webp)
-mappa-mundi ~/Pictures/iPhone --tiles ~/maps/tiles/           # folder laid out as z/x/y.png
+mappa-mundi ~/ssd/icloud-photos            # open the library once, so it's indexed
+tools/street-maps plan                     # how many tiles, roughly how big
+tools/street-maps download                 # fetch them (resumable)
 ```
 
-The overlay is remembered, so you only pass `--tiles` once. Wherever it has no
-tiles, the built-in map shows through, and past its maximum zoom it's scaled
-up. QGIS can produce MBTiles from any map source you're licensed to use
-(Processing → *Generate XYZ tiles (MBTiles)*). Don't bulk-download from
-tile.openstreetmap.org; its usage policy forbids that. Vector (`pbf`) MBTiles
-aren't supported.
+How it works:
+
+- **Coverage:** you get full street detail within 3 km of every photo
+  (`--radius` changes that), and wider context at lower zooms.
+- **Where it goes:** everything is saved to
+  `~/.local/share/mappa-mundi/streets.pmtiles`, which Mappa Mundi loads
+  automatically.
+- **New places:** after adding photos from new places, run `download` again.
+  It only fetches what's new.
+- **Zooming past 15:** the data goes down to zoom 15. The app keeps zooming to
+  20 by drawing the same vectors larger, so streets stay sharp.
+- **Outside the downloaded areas:** the built-in map shows.
+- **Style:** the streets are drawn in the dungeonOS style. Highways are brass,
+  main roads clay and side streets stone; buildings are darker blocks, parks
+  moss and water near-black.
+- **Names:** street names follow their streets. Japanese, Chinese and Korean
+  names use Noto Sans CJK when it's installed.
+
+Map data © OpenStreetMap contributors, available under the
+[ODbL](https://www.openstreetmap.org/copyright).
+
+### Other offline tiles
+
+A `.pmtiles` file of your own (Protomaps basemap layers) can be used instead
+of the downloaded one, and raster tiles can be layered on top:
+
+```sh
+mappa-mundi --tiles ~/maps/region.pmtiles       # vector street maps, drawn by the app
+mappa-mundi --tiles ~/maps/region.mbtiles       # raster MBTiles (png/jpg/webp)
+mappa-mundi --tiles ~/maps/tiles/               # folder laid out as z/x/y.png
+```
+
+The choice is remembered, so you only pass `--tiles` once. Don't bulk-download
+from tile.openstreetmap.org; its usage policy forbids that.
 
 ## Where things are stored
 
@@ -204,6 +239,7 @@ aren't supported.
 - `~/.cache/mappa-mundi/index/`: the metadata cache, one file per library folder.
   Changed files are re-read automatically; press ⟳ to pick up new files.
 - `~/.cache/mappa-mundi/thumbs/`: the thumbnail cache. Safe to delete.
+- `~/.local/share/mappa-mundi/streets.pmtiles`: downloaded street maps.
 
 Your photos are only ever read, never modified.
 
@@ -243,7 +279,10 @@ cd .. && cargo run --release --example build_basemap -- ne-data assets/basemap.b
 | File | Purpose |
 | --- | --- |
 | `src/app.rs` | Window, markers, side panel |
-| `src/map.rs` | Map view, input, tile drawing, labels |
+| `src/map.rs` | Map view, input, tile drawing, labels (incl. street names along streets) |
+| `src/pmtiles.rs` | PMTiles v3 archive reader |
+| `src/mvt.rs` | Mapbox Vector Tile decoder |
+| `src/streets.rs` | Street-map style: draws OpenStreetMap tiles, collects names |
 | `src/basemap.rs` | Decodes and rasterises the embedded world map |
 | `src/tiles.rs` | Tile layers (built-in, MBTiles, tile folder) |
 | `src/library.rs` | Folder scan, EXIF/GPS, grouping originals with edits and Live clips, index cache |
@@ -256,5 +295,6 @@ cd .. && cargo run --release --example build_basemap -- ne-data assets/basemap.b
 | `src/viewer.rs` | Full-screen viewer |
 | `tools/build_basemap.rs` | Natural Earth → `assets/basemap.bin` |
 | `tools/icloud-photos` | iCloud download wrapper (Python, stdlib only) |
+| `tools/street-maps` | Street-map downloader (Python, stdlib only) |
 
 Map data: Natural Earth (public domain).

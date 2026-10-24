@@ -1,13 +1,17 @@
-//! Map tile layers: the built-in vector basemap, and optional raster tiles
-//! from a local `.mbtiles` file or a `{z}/{x}/{y}.png` folder for
-//! street-level detail.
+//! Map tile layers: the built-in world map, OpenStreetMap street maps
+//! (`.pmtiles` from tools/street-maps), and optional raster tiles from a
+//! local `.mbtiles` file or a `{z}/{x}/{y}.png` folder.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use egui::ColorImage;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
+use crate::pmtiles::Pmtiles;
+use crate::streets::{self, Labels, TileRef};
 use crate::texcache::TextureCache;
 use crate::work::WorkQueue;
 
@@ -27,10 +31,48 @@ pub struct TileLayer {
     /// Whether tile size follows the display's pixel density.
     pub scalable: bool,
     pub cache: TextureCache<TileKey, TileKey>,
+    /// Place and street names, for street maps.
+    pub labels: Option<StreetLabels>,
+}
+
+/// Names decoded alongside street map tiles, kept per data tile.
+pub struct StreetLabels {
+    rx: crossbeam_channel::Receiver<(DataTile, Arc<Labels>)>,
+    tiles: HashMap<DataTile, (Arc<Labels>, u64)>,
+    frame: u64,
+    /// Deepest zoom level the data has; deeper views reuse it.
+    pub data_max_zoom: u8,
+}
+
+pub type DataTile = (u8, u32, u32);
+
+impl StreetLabels {
+    pub fn get(&mut self, key: &DataTile) -> Option<Arc<Labels>> {
+        let frame = self.frame;
+        self.tiles.get_mut(key).map(|(l, used)| {
+            *used = frame;
+            l.clone()
+        })
+    }
+
+    fn pump(&mut self) {
+        self.frame += 1;
+        for (key, labels) in self.rx.try_iter() {
+            self.tiles.entry(key).or_insert((labels, self.frame));
+        }
+        if self.tiles.len() > 600 {
+            let mut by_age: Vec<(u64, DataTile)> = self.tiles.iter().map(|(k, (_, u))| (*u, *k)).collect();
+            by_age.sort_unstable();
+            for (_, k) in by_age.into_iter().take(200) {
+                self.tiles.remove(&k);
+            }
+        }
+    }
 }
 
 enum Source {
     Basemap,
+    Streets(Arc<Pmtiles>, crossbeam_channel::Sender<(DataTile, Arc<Labels>)>),
     MbTiles(PathBuf),
     Dir(PathBuf),
 }
@@ -39,6 +81,27 @@ impl TileLayer {
     pub fn basemap(ctx: &egui::Context) -> Self {
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6);
         Self::start(Source::Basemap, "Natural Earth".into(), 0, 20, true, threads, ctx)
+    }
+
+    /// Street maps from a vector `.pmtiles` archive, drawn in the app's
+    /// style. Zooming past the data's deepest level redraws its vectors at
+    /// a larger scale, so streets stay sharp down to zoom 20.
+    pub fn streets(path: &Path, ctx: &egui::Context) -> anyhow::Result<Self> {
+        let pm = Arc::new(Pmtiles::open(path)?);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let labels = StreetLabels { rx, tiles: HashMap::new(), frame: 0, data_max_zoom: pm.max_zoom };
+        let (min, attribution) = (pm.min_zoom, strip_html(&pm.attribution));
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 6);
+        let mut layer = Self::start(Source::Streets(pm, tx), attribution, min, 20, true, threads, ctx);
+        layer.labels = Some(labels);
+        Ok(layer)
+    }
+
+    pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        self.cache.begin_frame(ctx);
+        if let Some(l) = &mut self.labels {
+            l.pump();
+        }
     }
 
     /// Opens a raster `.mbtiles` file or a directory laid out as `z/x/y.png`.
@@ -87,7 +150,7 @@ impl TileLayer {
     ) -> Self {
         let queue = WorkQueue::new();
         let (tx, rx) = crossbeam_channel::unbounded();
-        let source = std::sync::Arc::new(source);
+        let source = Arc::new(source);
         queue.spawn_workers("tiles", threads, tx, ctx.clone(), move || {
             let source = source.clone();
             let mut conn: Option<Connection> = None;
@@ -101,7 +164,7 @@ impl TileLayer {
         });
         // Budget roughly 200 MB of GPU memory for tiles.
         let cache = TextureCache::new("tile", 200, queue, rx);
-        Self { attribution, min_zoom, max_zoom, scalable, cache }
+        Self { attribution, min_zoom, max_zoom, scalable, cache, labels: None }
     }
 }
 
@@ -109,6 +172,15 @@ fn load_tile(source: &Source, conn: &mut Option<Connection>, k: TileKey) -> anyh
     let bytes = match source {
         Source::Basemap => {
             let px = crate::basemap::get().render_tile(k.z, k.x, k.y, k.px).context("render failed")?;
+            return Ok(Some(ColorImage::from_rgba_premultiplied([k.px as usize; 2], &px)));
+        }
+        Source::Streets(pm, labels) => {
+            let t = TileRef::new(k.z, k.x, k.y, pm.max_zoom);
+            let Some(data) = pm.tile(t.dz, t.dx, t.dy)? else { return Ok(None) };
+            let layers = crate::mvt::decode(&data, streets::wanted_layer)?;
+            // Every tile sends its data tile's names (cheap); the UI keeps the first.
+            let _ = labels.send(((t.dz, t.dx, t.dy), Arc::new(streets::labels(&layers, t.dz, t.dx, t.dy))));
+            let px = streets::render(&layers, &t, k.px).context("render failed")?;
             return Ok(Some(ColorImage::from_rgba_premultiplied([k.px as usize; 2], &px)));
         }
         Source::MbTiles(path) => {

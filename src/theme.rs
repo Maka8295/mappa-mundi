@@ -97,6 +97,11 @@ fn fonts() -> egui::FontDefinitions {
             defs.families.entry(family).or_default().insert(0, "fantasque".into());
         }
     }
+    // Japanese, Chinese and Korean place and street names.
+    if let Some(data) = system_font("Noto Sans CJK JP") {
+        defs.font_data.insert("cjk".into(), Arc::new(FontData::from_owned(data)));
+        defs.families.entry(FontFamily::Proportional).or_default().push("cjk".into());
+    }
     // Anything CloisterBlack lacks (digits look odd in it, accents) falls
     // through to the body font.
     blackletter_chain.extend(defs.families[&FontFamily::Proportional].iter().cloned());
