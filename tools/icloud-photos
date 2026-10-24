@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""Download an iCloud Photos library at full quality, and check the result.
+
+    icloud-photos login       sign in to iCloud (password + 2FA code), about every two months
+    icloud-photos download    download everything not downloaded yet; safe to stop and re-run
+    icloud-photos verify      check the downloaded files and count them
+    icloud-photos status      show settings and whether the login is still valid
+
+Uses icloudpd (https://github.com/icloud-photos-downloader/icloud_photos_downloader)
+with the settings that keep the most: original files byte-for-byte (full-resolution
+HEIC with all EXIF/GPS), edited versions alongside, every Live Photo's motion clip
+under the same name as its photo, and an XMP sidecar per file with what only iCloud
+knows (locations/dates changed in Photos, captions, keywords, favourites).
+
+Settings live in ~/.config/icloud-photos/config.json (written by `login`).
+"""
+
+import argparse
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "icloud-photos" / "config.json"
+COOKIES = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "icloud-photos" / "session"
+DEFAULT_DEST = Path.home() / "ssd" / "icloud-photos"
+# Created by `login`; if it's missing the library's drive probably isn't
+# mounted, and downloading would fill up whatever is underneath instead.
+MARKER = ".icloud-photos-library"
+
+# Chosen once: changing any naming option later makes icloudpd download
+# everything again under new names. Sidecars are written in a separate pass
+# (see write_sidecars).
+DOWNLOAD_FLAGS = [
+    "--size", "original",             # the untouched file the iPhone uploaded
+    "--size", "adjusted",             # plus the edited version, for edited photos
+    "--live-photo-size", "original",  # full-quality Live Photo clip
+    "--live-photo-mov-filename-policy", "original",  # IMG_1234.MOV next to IMG_1234.HEIC
+    "--file-match-policy", "name-id7",  # unique names: IMG_ numbers repeat
+    "--keep-unicode-in-filenames",
+    "--no-progress-bar",
+]
+# Ask on the console only, so the password is never stored anywhere.
+AUTH_FLAGS = ["--password-provider", "console", "--mfa-provider", "console"]
+
+MAX_PASSES = 4
+# A pass that prints nothing and grows no .part file for this long is stuck.
+STALL_SECONDS = 20 * 60
+
+PHOTO_EXT = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".dng", ".tif", ".tiff", ".gif", ".webp", ".avif"}
+VIDEO_EXT = {".mov", ".mp4", ".m4v"}
+
+
+def die(msg, code=1):
+    print(f"\n{msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    if not CONFIG.exists():
+        die("Not set up yet. Run:  icloud-photos login")
+    cfg = json.loads(CONFIG.read_text())
+    cfg["dest"] = Path(cfg["dest"]).expanduser()
+    return cfg
+
+
+def icloudpd():
+    exe = shutil.which(os.environ.get("ICLOUDPD", "icloudpd"))
+    if not exe:
+        die("icloudpd is not installed. On Arch:  paru -S icloudpd-bin")
+    return exe
+
+
+def base_cmd(cfg):
+    return [icloudpd(), "--username", cfg["apple_id"], "--cookie-directory", str(COOKIES), *AUTH_FLAGS]
+
+
+# ---------------------------------------------------------------- login
+
+def cmd_login(args):
+    cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    apple_id = args.apple_id or cfg.get("apple_id") or input("Apple ID (email): ").strip()
+    dest = Path(args.dest or cfg.get("dest") or DEFAULT_DEST).expanduser()
+    if not apple_id:
+        die("An Apple ID is needed.")
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    COOKIES.mkdir(parents=True, exist_ok=True)
+    COOKIES.chmod(0o700)
+    CONFIG.write_text(json.dumps({"apple_id": apple_id, "dest": str(dest)}, indent=2) + "\n")
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / MARKER).touch()
+    print(f"Library folder: {dest}\n")
+    print("Before signing in, on your iPhone check:")
+    print("  Settings → [your name] → iCloud → Access iCloud Data on the Web: ON")
+    print("  Settings → [your name] → iCloud → Advanced Data Protection: OFF")
+    print("  (icloudpd uses iCloud's web access, which those settings control.)\n")
+    cfg = {"apple_id": apple_id, "dest": dest}
+    # Interactive: icloudpd asks for the password and the 2FA code itself.
+    subprocess.run([*base_cmd(cfg), "--auth-only"])
+    if session_files():
+        print("\nSigned in. Now run:  icloud-photos download")
+    else:
+        die("Sign-in did not complete.")
+
+
+def session_files():
+    return [p for p in COOKIES.glob("*") if p.is_file()] if COOKIES.exists() else []
+
+
+# ---------------------------------------------------------------- download
+
+class Pass:
+    """Outcome of one icloudpd run, read from its log (its exit code is always 0)."""
+
+    def __init__(self):
+        self.downloaded = 0
+        self.failed = []
+        self.need_login = False
+        self.web_access_off = False
+        self.throttled = False
+        self.indexing = False
+        self.errors = []
+        self.stalled = False
+        self.sidecar_crash = False
+        # The file icloudpd was last working on (possibly shortened with "...").
+        self.last_path = None
+
+    def feed(self, line):
+        l = line.lower()
+        m = re.search(r"(?:DEBUG|INFO)\s+(?:Downloaded (.+)|(.+) already exists)$", line.rstrip())
+        if m:
+            self.last_path = m.group(1) or m.group(2)
+        if "zlib.error" in l or "xmp_sidecar.py" in l:
+            self.sidecar_crash = True
+        if " downloaded " in l or l.startswith("downloaded "):
+            self.downloaded += 1
+        elif "could not download" in l:
+            self.failed.append(line.strip())
+        elif "private db access disabled" in l or "access_denied" in l and "private" in l:
+            self.web_access_off = True
+        elif "throttle" in l or "temporary refusing" in l or "503" in l and "service unavailable" in l:
+            self.throttled = True
+        elif "has not finished indexing" in l:
+            self.indexing = True
+        elif ("authentication is required" in l or "authentication required" in l or "password for" in l
+              or "invalid email/password" in l or "eoferror" in l or "failed to verify two-step" in l):
+            self.need_login = True
+        elif "traceback" in l or " error " in l:
+            self.errors.append(line.strip())
+
+
+def run_logged(cmd, log, dest, echo=True):
+    """Runs icloudpd non-interactively, teeing its output to `log`, and kills
+    it if it stalls."""
+    result = Pass()
+    log.write(f"\n$ {' '.join(cmd)}\n")
+    log.flush()
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+    lines = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout] + [lines.put(None)], daemon=True).start()
+
+    try:
+        watch(proc, lines, result, log, dest, echo)
+    finally:
+        # icloudpd runs in its own process group (so a stall can kill all of
+        # it); make sure Ctrl-C or an error here doesn't leave it running.
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait()
+    return result
+
+
+def watch(proc, lines, result, log, dest, echo):
+    last_activity = time.monotonic()
+    part_sizes = {}
+    while True:
+        try:
+            line = lines.get(timeout=60)
+        except queue.Empty:
+            # Quiet is fine while a large video is still growing.
+            sizes = {p: p.stat().st_size for p in dest.rglob("*.part") if p.exists()}
+            if sizes != part_sizes:
+                part_sizes = sizes
+                last_activity = time.monotonic()
+            if time.monotonic() - last_activity > STALL_SECONDS:
+                result.stalled = True
+                log.write("icloud-photos: no progress for 20 minutes, restarting\n")
+                os.killpg(proc.pid, signal.SIGTERM)
+            continue
+        if line is None:
+            break
+        last_activity = time.monotonic()
+        log.write(line)
+        log.flush()
+        result.feed(line)
+        if echo and ("Downloaded" in line or "Could not download" in line or "ERROR" in line):
+            # Drop the timestamp and level icloudpd prefixes each line with.
+            print("  " + re.sub(r"^\S+ \S+ [A-Z]+\s+", "", line.rstrip())[:150])
+
+
+def libraries(cfg):
+    """PrimarySync plus any iCloud Shared Library the account belongs to."""
+    out = subprocess.run([*base_cmd(cfg), "--list-libraries"], stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True)
+    names = [l.strip() for l in out.stdout.splitlines() if re.fullmatch(r"[A-Za-z]+Sync(-[\w-]+)?", l.strip())]
+    if not names:
+        tail = (out.stdout + out.stderr).strip().splitlines()[-5:]
+        probe = Pass()
+        for l in tail:
+            probe.feed(l)
+        if probe.need_login:
+            die("The iCloud login has expired. Run:  icloud-photos login", 2)
+        if probe.web_access_off:
+            die(WEB_ACCESS_HELP, 2)
+        die("Could not list the iCloud libraries:\n  " + "\n  ".join(tail))
+    return sorted(names, key=lambda n: n != "PrimarySync")
+
+
+WEB_ACCESS_HELP = """iCloud refused access to your photos. On your iPhone:
+  Settings → [your name] → iCloud → Advanced Data Protection: OFF
+  Settings → [your name] → iCloud → Access iCloud Data on the Web: ON
+then sign in again with:  icloud-photos login"""
+
+
+def cmd_download(args):
+    cfg = load_config()
+    dest = cfg["dest"]
+    if not (dest / MARKER).exists():
+        die(f"{dest} is not there (is its drive mounted?). To start a new library there, run:  icloud-photos login")
+    logs = dest / ".icloud-photos-logs"
+    logs.mkdir(exist_ok=True)
+    log_path = logs / f"{datetime.now():%Y-%m-%d_%H%M%S}.log"
+
+    libs = libraries(cfg)
+    targets = [(lib, dest if lib == "PrimarySync" else dest / "Shared Library", []) for lib in libs]
+    if args.hidden:
+        targets.append(("PrimarySync", dest / "Hidden", ["--album", "Hidden"]))
+    print(f"Downloading into {dest}")
+    print(f"Libraries: {', '.join(libs)}{' + Hidden album' if args.hidden else ''}")
+    print(f"Log: {log_path}\n")
+
+    with open(log_path, "a") as log:
+        complete = download_media(cfg, targets, log, dest)
+        if not args.no_sidecars:
+            write_sidecars(cfg, targets, log, dest)
+    if not complete:
+        sys.exit(1)
+    print("Next: icloud-photos verify")
+
+
+def check_fatal(p):
+    if p.need_login:
+        die("The iCloud login has expired. Run:  icloud-photos login", 2)
+    if p.web_access_off:
+        die(WEB_ACCESS_HELP, 2)
+    if p.throttled:
+        die("iCloud is throttling requests. Wait an hour or so and run this again "
+            "(it picks up where it stopped).", 3)
+
+
+def download_media(cfg, targets, log, dest):
+    """Downloads photos and videos, pass after pass, until nothing is new."""
+    total = 0
+    for n in range(1, MAX_PASSES + 1):
+        print(f"Pass {n}:")
+        passes = []
+        for lib, folder, extra in targets:
+            cmd = [*base_cmd(cfg), *DOWNLOAD_FLAGS, "--log-level", "info",
+                   "--directory", str(folder), "--library", lib, *extra]
+            p = run_logged(cmd, log, dest)
+            passes.append(p)
+            check_fatal(p)
+        got = sum(p.downloaded for p in passes)
+        failed = [f for p in passes for f in p.failed]
+        total += got
+        unsure = any(p.indexing or p.stalled or p.errors for p in passes)
+        print(f"  → {got} files downloaded, {len(failed)} failed\n")
+        # A pass that found nothing new and had no trouble means we're done.
+        # Anything else gets another pass: icloudpd tries each file once,
+        # and iCloud sometimes ends a listing early.
+        if got == 0 and not failed and not unsure:
+            print(f"Photos and videos are up to date ({total} new files this run).\n")
+            return True
+    problems = failed + [e for p in passes for e in p.errors]
+    print(f"Stopped after {MAX_PASSES} passes; {total} new files this run.")
+    if problems:
+        print("Still failing (run `icloud-photos download` again later):")
+        for f in problems[:20]:
+            print("  " + f)
+    if any(p.indexing for p in passes):
+        print("iCloud reported its library index is still being built; try again later.")
+    return False
+
+
+def write_sidecars(cfg, targets, log, dest):
+    """Writes an XMP sidecar next to every downloaded file.
+
+    icloudpd crashes on some edited photos while building their sidecar
+    (issue #1063), at the same photo on every run, which would stall a
+    combined download forever. So sidecars get their own pass, and each crash
+    fences the offending photo off by its capture time (icloudpd sets every
+    file's mtime to it) and carries on either side of it."""
+    print("Writing XMP sidecars…")
+    skipped = []
+    for lib, folder, extra in targets:
+        windows = [(None, None)]
+        while windows:
+            lo, hi = windows.pop()
+            # Debug level logs every file, which is how a crash is located.
+            cmd = [*base_cmd(cfg), *DOWNLOAD_FLAGS, "--xmp-sidecar", "--log-level", "debug",
+                   "--directory", str(folder), "--library", lib, *extra]
+            if lo is not None:
+                cmd += ["--skip-created-before", iso(lo)]
+            if hi is not None:
+                cmd += ["--skip-created-after", iso(hi)]
+            p = run_logged(cmd, log, dest, echo=False)
+            check_fatal(p)
+            if not p.sidecar_crash:
+                continue
+            culprit = locate(p.last_path, folder)
+            if culprit is None or len(skipped) >= 50:
+                print("  icloudpd keeps crashing while writing sidecars; some are missing.")
+                print(f"  (last file: {p.last_path}; see the log)")
+                break
+            t = culprit.stat().st_mtime
+            skipped.append(culprit)
+            log.write(f"icloud-photos: sidecar crash at {culprit}, skipping {iso(t)}\n")
+            windows += [(lo, t - 1), (t + 1, hi)]
+            windows = [(a, b) for a, b in windows if a is None or b is None or a <= b]
+    if skipped:
+        print(f"  {len(skipped)} photos have no sidecar because icloudpd crashed on them (issue #1063):")
+        for f in skipped:
+            print(f"    {f}")
+        print("  Their files are downloaded; only the iCloud-only metadata is missing.")
+    else:
+        print("  Done.")
+
+
+def iso(epoch):
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+def locate(logged, folder):
+    """The file behind a log line's path, which icloudpd shortens to 96
+    characters with '...' in the middle."""
+    if not logged:
+        return None
+    if "..." not in logged:
+        p = Path(logged)
+        return p if p.exists() else None
+    tail = logged.split("...", 1)[1]
+    name = Path(tail).name
+    matches = [p for p in folder.rglob(name) if str(p).endswith(tail)] if name else []
+    return matches[0] if len(matches) == 1 else None
+
+
+# ---------------------------------------------------------------- verify
+
+def check_boxes(path):
+    """HEIC, MOV and MP4 are ISO-BMFF: a chain of boxes that each state their
+    length. A cut-off download leaves the last box (the media data) claiming
+    more bytes than the file has."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            pos = 0
+            while pos + 8 <= size:
+                f.seek(pos)
+                head = f.read(16)
+                length, kind = int.from_bytes(head[:4], "big"), head[4:8].decode("latin-1")
+                if length == 1:
+                    length = int.from_bytes(head[8:16], "big")
+                elif length == 0:  # runs to the end of the file
+                    return None
+                if length < 8:
+                    return f"corrupt box structure at byte {pos}"
+                if pos + length > size:
+                    return f"cut off: '{kind}' needs {pos + length - size:,} more bytes"
+                pos += length
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def probe_video(path):
+    """Problem description, or None if the video looks complete."""
+    if err := check_boxes(path):
+        return err
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return (r.stderr.strip().splitlines() or ["unreadable"])[-1].replace(f"{path}: ", "")
+    # icloudpd has been seen to cut very large videos short (issue #1311):
+    # decode the last seconds to make sure the end is really there.
+    if path.stat().st_size > 900_000_000:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-sseof", "-3", "-i", str(path), "-f", "null", "-"],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or r.stderr.strip():
+            return "the end of the video is missing or damaged"
+    return None
+
+
+def probe_photo(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+            size = f.seek(0, os.SEEK_END)
+            if size == 0:
+                return "empty file"
+            if path.suffix.lower() in (".jpg", ".jpeg"):
+                # The end-of-image marker; some cameras append data after it.
+                f.seek(max(0, size - 65536))
+                if head[:2] != b"\xff\xd8" or b"\xff\xd9" not in f.read():
+                    return "incomplete JPEG"
+            elif path.suffix.lower() in (".heic", ".heif"):
+                if head[4:8] != b"ftyp":
+                    return "not a HEIF file"
+                return check_boxes(path)
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def cmd_verify(args):
+    cfg = load_config()
+    dest = cfg["dest"]
+    if not dest.exists():
+        die(f"{dest} does not exist yet. Run:  icloud-photos download")
+    photos, videos, sidecars, partial = [], [], 0, []
+    for p in dest.rglob("*"):
+        if not p.is_file() or any(part.startswith(".") for part in p.relative_to(dest).parts):
+            continue
+        ext = p.suffix.lower()
+        if ext == ".part":
+            partial.append(p)
+        elif ext == ".xmp":
+            sidecars += 1
+        elif ext in PHOTO_EXT:
+            photos.append(p)
+        elif ext in VIDEO_EXT:
+            videos.append(p)
+
+    stems = {(p.parent, p.stem.lower()) for p in photos}
+    live = [v for v in videos if (v.parent, v.stem.lower()) in stems]
+    edited = [p for p in photos + videos if p.stem.lower().endswith("-adjusted")]
+    plain_videos = len(videos) - len(live)
+
+    print(f"Checking {len(photos) + len(videos)} files in {dest} …")
+    problems = []
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        for path, err in zip(videos, pool.map(probe_video, videos)):
+            if err:
+                problems.append((path, err))
+        for path, err in zip(photos, pool.map(probe_photo, photos)):
+            if err:
+                problems.append((path, err))
+    if shutil.which("ffprobe") is None:
+        print("(ffprobe not found: videos were not checked)")
+
+    print()
+    print(f"  Photos            {len(photos) - len([e for e in edited if e.suffix.lower() in PHOTO_EXT]):>8}")
+    print(f"    with Live clip  {len(live):>8}")
+    print(f"  Videos            {plain_videos - len([e for e in edited if e.suffix.lower() in VIDEO_EXT]):>8}")
+    print(f"  Edited versions   {len(edited):>8}")
+    print(f"  XMP sidecars      {sidecars:>8}")
+    print()
+    print("Compare with the totals at the bottom of Photos → Library → All on your iPhone.")
+    print("(The iPhone may count edits made in another format, e.g. a JPEG beside a HEIC, as one photo.)")
+    if partial:
+        print(f"\n{len(partial)} unfinished downloads (.part files); `icloud-photos download` resumes them.")
+    if problems:
+        print(f"\n{len(problems)} damaged files. Delete them and run `icloud-photos download` to fetch them again:")
+        for path, err in problems:
+            print(f"  {path}: {err}")
+        sys.exit(1)
+    print("\nNo damaged files found.")
+
+
+# ---------------------------------------------------------------- status
+
+def cmd_status(args):
+    if not CONFIG.exists():
+        die("Not set up yet. Run:  icloud-photos login")
+    cfg = load_config()
+    print(f"Apple ID:        {cfg['apple_id']}")
+    print(f"Library folder:  {cfg['dest']}")
+    files = session_files()
+    if files:
+        age = (time.time() - max(f.stat().st_mtime for f in files)) / 86400
+        print(f"Login:           saved {age:.0f} days ago (Apple keeps it about 60 days)")
+    else:
+        print("Login:           none. Run:  icloud-photos login")
+    logs = sorted((cfg["dest"] / ".icloud-photos-logs").glob("*.log"))
+    if logs:
+        print(f"Last download:   {logs[-1].stem.replace('_', ' ')}  ({logs[-1]})")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("login", help="sign in to iCloud (password and 2FA code)")
+    p.add_argument("--apple-id")
+    p.add_argument("--dest", help=f"where to put the library (default {DEFAULT_DEST})")
+    p.set_defaults(func=cmd_login)
+    p = sub.add_parser("download", help="download everything new")
+    p.add_argument("--hidden", action="store_true", help="also download the Hidden album (into Hidden/)")
+    p.add_argument("--no-sidecars", action="store_true", help="skip the XMP sidecar pass")
+    p.set_defaults(func=cmd_download)
+    sub.add_parser("verify", help="check the downloaded files").set_defaults(func=cmd_verify)
+    sub.add_parser("status", help="show settings and login state").set_defaults(func=cmd_status)
+    args = ap.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        die("Interrupted. Run the same command again to continue where it stopped.", 130)
+
+
+if __name__ == "__main__":
+    main()

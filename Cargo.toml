@@ -1,0 +1,37 @@
+[package]
+name = "mappa-mundi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Offline map of where your photos were taken (HEIC, Live Photos, videos)"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+eframe = "0.37.0"
+egui = "0.37.0"
+flate2 = "1.1.10"
+image = "0.25.10"
+kamadak-exif = "0.6.1"
+libheif-rs = "3.0.0"
+rayon = "1.12.0"
+rfd = "0.17.2"
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny-skia = "0.12.0"
+walkdir = "2.5.0"
+
+# Developer tool that regenerates assets/basemap.bin; an example so that
+# `cargo install` leaves it out.
+[[example]]
+name = "build_basemap"
+path = "tools/build_basemap.rs"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"

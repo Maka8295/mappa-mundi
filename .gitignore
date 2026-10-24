@@ -1,0 +1,4 @@
+/target
+# Natural Earth source data; re-download with the command in README.md
+/ne-data
+__pycache__/
