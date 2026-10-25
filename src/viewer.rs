@@ -398,7 +398,7 @@ impl Viewer {
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         let playing = self.playback.is_some();
-        if buttons.button("Open…").on_hover_text("Open in the default app (with sound)").clicked() {
+        if buttons.button("Open…").on_hover_text("Open in the default app").clicked() {
             video::open_external(item.image_path());
         }
         if item.has_location() && buttons.button("Show on Map").clicked() {
@@ -422,6 +422,11 @@ impl Viewer {
             Kind::Photo => item.live.as_deref(),
         };
         if let Some(path) = motion {
+            let muted = video::muted();
+            let mute = ui.input(|i| i.key_pressed(Key::M));
+            if buttons.add(egui::Button::new("Mute").selected(muted)).on_hover_text("M").clicked() || mute {
+                video::set_muted(!muted);
+            }
             let label = match (item.kind, playing) {
                 (_, true) => "■  Stop",
                 (Kind::Video, false) => "Play",

@@ -28,7 +28,7 @@ street maps for the places you've been are downloaded once, ahead of time.
   write), JPEG, PNG, WebP, MOV/MP4.
 - **Live Photos:** the still and its `.MOV` (or icloudpd's `_HEVC.MOV`) are
   paired by file name and shown as a single item with a **LIVE** badge. Press Space in the viewer to play the
-  motion clip.
+  motion clip, with its sound.
 - **Videos with location:** placed using Apple's QuickTime location metadata
   (or the `©xyz`/`loci` boxes other cameras use).
 - **Markers like Apple's:** grouped photos show the newest photo plus a
@@ -40,8 +40,8 @@ street maps for the places you've been are downloaded once, ahead of time.
   included. Jump to a year from the column on the right.
 - **Viewer:** zooms to full resolution (double-click for 100%, drag to look
   around), with date, place name, coordinates and camera model. Navigate with
-  ←/→, play Live Photos and videos with Space (silent; **Open…** plays with
-  sound in your default player), and jump back with **Show on Map**.
+  ←/→, play Live Photos and videos with sound with Space (M mutes), and jump
+  back with **Show on Map**.
 - **Edits and iCloud metadata:** an edited version (`IMG_1234-adjusted.HEIC`,
   or a JPEG beside the HEIC) is shown in place of its original, as in Photos.
   XMP sidecars (`IMG_1234.HEIC.xmp`) override the file's location and date,
@@ -67,12 +67,14 @@ street maps for the places you've been are downloaded once, ahead of time.
 Requirements:
 
 - Rust 1.95 or newer (egui's minimum)
-- `libheif` (1.17+) with its development files and `pkg-config`
-  - Arch: `pacman -S libheif`
-  - Debian/Ubuntu: `apt install libheif-dev pkg-config`
-  - Fedora: `dnf install libheif-devel`
-- `ffmpeg` at runtime, for video thumbnails and Live Photo playback. It's
-  optional; photos work without it.
+- `libheif` (1.17+) and, on Linux, ALSA (for sound), with their development
+  files and `pkg-config`
+  - Arch: `pacman -S libheif alsa-lib`
+  - Debian/Ubuntu: `apt install libheif-dev libasound2-dev pkg-config`
+  - Fedora: `dnf install libheif-devel alsa-lib-devel`
+- `ffmpeg` (5.1+, with its `ffprobe`) at runtime, for video thumbnails and
+  playback. It's optional; photos work without it. Sound plays through
+  PulseAudio or PipeWire, or ALSA if neither is running.
 
 ```sh
 cargo build --release
@@ -106,6 +108,7 @@ sed "s|^Exec=mappa-mundi|Exec=$HOME/.cargo/bin/mappa-mundi|" assets/mappa-mundi.
 | See a photo at full resolution | Double-click it (or **Full size**) for 100%; scroll, pinch or `+`/`−` to zoom; drag to look around |
 | Next / previous photo | `→` / `←` |
 | Play Live Photo / video | Space, or the **LIVE** / **Play** button |
+| Mute / unmute | M, or **Mute** |
 | Close viewer or panel | Esc (when zoomed in, Esc first returns to the whole photo) |
 
 ## Getting photos off the iPhone with their location intact
@@ -308,7 +311,7 @@ cd .. && cargo run --release --example build_basemap -- ne-data assets/basemap.b
 | `src/theme.rs` | dungeonOS palette, fonts and frames |
 | `src/quicktime.rs` | Location and date from MOV/MP4 |
 | `src/imageio.rs` | HEIC/JPEG decoding, orientation, P3→sRGB, thumbnail cache |
-| `src/video.rs` | ffmpeg poster frames and playback |
+| `src/video.rs` | ffmpeg poster frames; playback with sound, the picture kept in time with it |
 | `src/cluster.rs` | Zoom-level marker grouping |
 | `src/viewer.rs` | Full-screen viewer |
 | `src/timeline.rs` | Photos by date |

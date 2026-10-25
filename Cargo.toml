@@ -8,6 +8,7 @@ description = "Offline map of where your photos were taken (HEIC, Live Photos, v
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
 crossbeam-channel = "0.5.17"
 dirs = "7.0.0"
 eframe = "0.37.0"
