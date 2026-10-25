@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Offline map of where your photos were taken (HEIC, Live Photos, videos)"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"

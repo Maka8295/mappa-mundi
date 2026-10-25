@@ -320,3 +320,8 @@ cd .. && cargo run --release --example build_basemap -- ne-data assets/basemap.b
 | `tools/street-maps` | Street-map downloader (Python, stdlib only) |
 
 Map data: Natural Earth (public domain).
+
+## Licence
+
+MIT; see [LICENSE](LICENSE). Development notes and the bill of materials are in
+[NOTES.md](NOTES.md).
