@@ -30,10 +30,10 @@ street maps for the places you've been are downloaded once, ahead of time.
 - **Markers like Apple's:** grouped photos show the newest photo plus a
   count. Click one to see the group in a grid, or double-click to zoom in
   until it splits.
-- **Viewer:** full resolution, with date, place name, coordinates and camera
-  model. Navigate with ←/→, play Live Photos and videos with Space (silent;
-  **Open…** plays with sound in your default player), and jump back with
-  **Show on Map**.
+- **Viewer:** zooms to full resolution (double-click for 100%, drag to look
+  around), with date, place name, coordinates and camera model. Navigate with
+  ←/→, play Live Photos and videos with Space (silent; **Open…** plays with
+  sound in your default player), and jump back with **Show on Map**.
 - **Edits and iCloud metadata:** an edited version (`IMG_1234-adjusted.HEIC`,
   or a JPEG beside the HEIC) is shown in place of its original, as in Photos.
   XMP sidecars (`IMG_1234.HEIC.xmp`) override the file's location and date,
@@ -94,9 +94,10 @@ sed "s|^Exec=mappa-mundi|Exec=$HOME/.cargo/bin/mappa-mundi|" assets/mappa-mundi.
 | See the photos in a group | Click a marker |
 | Zoom into a group | Double-click a marker |
 | Open a photo | Click it in the side panel |
+| See a photo at full resolution | Double-click it (or **Full size**) for 100%; scroll, pinch or `+`/`−` to zoom; drag to look around |
 | Next / previous photo | `→` / `←` |
 | Play Live Photo / video | Space, or the **LIVE** / **Play** button |
-| Close viewer or panel | Esc |
+| Close viewer or panel | Esc (when zoomed in, Esc first returns to the whole photo) |
 
 ## Getting photos off the iPhone with their location intact
 
@@ -155,6 +156,7 @@ Then:
 
 ```sh
 tools/icloud-photos download   # stop with Ctrl-C any time; re-run to continue
+tools/icloud-photos download --parallel 4   # about twice as fast for a large library
 tools/icloud-photos verify     # checks every file, prints counts to compare with the iPhone
 tools/icloud-photos status     # login age, last run
 mappa-mundi ~/ssd/icloud-photos
@@ -177,6 +179,13 @@ The wrapper also handles icloudpd 1.32.3's known problems:
   with ffprobe, and decodes the end of large ones.
 - **Unmounted drive:** if the library's drive isn't mounted, `download`
   refuses to run, so it can't silently fill the disk underneath.
+
+icloudpd downloads one file at a time, and Apple's per-file delay, not your
+connection, sets the pace. `--parallel N` lists what's missing, splits it into
+date ranges and runs N icloudpd processes at once, each with its own copy of
+the session. A normal pass then confirms nothing was missed, followed by the
+sidecars and `verify`, which also compares the number of photos on disk with
+iCloud's count. Only one `download` can run per library at a time.
 
 `--hidden` also downloads the Hidden album (into `Hidden/`). The naming options
 are fixed on purpose: changing them later makes icloudpd download everything

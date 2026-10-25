@@ -44,6 +44,8 @@ impl Job {
 pub struct Media {
     thumbs: TextureCache<u64, Job>,
     full: TextureCache<u64, Job>,
+    /// Images at their own size, for zooming in on the one being viewed.
+    original: TextureCache<u64, Job>,
 }
 
 impl Media {
@@ -59,17 +61,21 @@ impl Media {
             // ~800 thumbnails of 320x240 is roughly 250 MB of GPU memory.
             thumbs: start("thumb", (cores / 2).clamp(2, 8), 800),
             full: start("full", 2, 6),
+            // A 12 MP photo is ~50 MB of GPU memory.
+            original: start("original", 1, 2),
         }
     }
 
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
         self.thumbs.begin_frame(ctx);
         self.full.begin_frame(ctx);
+        self.original.begin_frame(ctx);
     }
 
     pub fn end_frame(&mut self) {
         self.thumbs.end_frame();
         self.full.end_frame();
+        self.original.end_frame();
     }
 
     pub fn thumb(&mut self, item: &Item, priority: f32) -> Option<TextureHandle> {
@@ -94,6 +100,19 @@ impl Media {
 
     pub fn full_failed(&self, item: &Item) -> bool {
         self.full.failed(&item.key)
+    }
+
+    /// The image without downscaling (up to `max_side`, the GPU's limit).
+    pub fn original(&mut self, item: &Item, max_side: u32) -> Option<TextureHandle> {
+        if let Some(t) = self.original.get(&item.key) {
+            return Some(t.clone());
+        }
+        self.original.request(item.key, 0.0, || Job::new(item, max_side));
+        None
+    }
+
+    pub fn original_failed(&self, item: &Item) -> bool {
+        self.original.failed(&item.key)
     }
 }
 

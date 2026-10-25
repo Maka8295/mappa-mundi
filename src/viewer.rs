@@ -1,6 +1,8 @@
 //! Full-screen photo viewer with Live Photo and video playback.
 
-use egui::{Align2, Color32, FontId, Key, Rect, RichText, Sense, TextureHandle, Ui, pos2, vec2};
+use egui::{
+    Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, RichText, Sense, TextureHandle, Ui, Vec2, pos2, vec2,
+};
 
 use crate::library::{Item, Kind, Library};
 use crate::media::Media;
@@ -19,17 +21,47 @@ struct Playback {
     texture: Option<TextureHandle>,
 }
 
+/// How far the photo is zoomed in: `scale` 1 fits it to the window, and
+/// `offset` moves its centre away from the window's centre, in points.
+#[derive(Clone, Copy)]
+struct Zoom {
+    scale: f32,
+    offset: Vec2,
+}
+
+impl Zoom {
+    const FIT: Self = Self { scale: 1.0, offset: Vec2::ZERO };
+
+    fn zoomed(&self) -> bool {
+        self.scale > 1.001
+    }
+
+    /// Zooms to `scale`, keeping the point under `anchor` where it is.
+    fn zoom_about(&mut self, area: Rect, anchor: Pos2, scale: f32) {
+        let centre = area.center() + self.offset;
+        self.offset = anchor - (anchor - centre) * (scale / self.scale) - area.center();
+        self.scale = scale;
+    }
+
+    /// Keeps a photo of `size` covering the window wherever it's bigger.
+    fn clamp(&mut self, area: Rect, size: Vec2) {
+        let room = ((size - area.size()) / 2.0).max(Vec2::ZERO);
+        self.offset = self.offset.clamp(-room, room);
+    }
+}
+
 pub struct Viewer {
     pub items: Vec<u32>,
     pub pos: usize,
     playback: Option<Playback>,
     place: Option<(u32, String)>,
     error: Option<String>,
+    zoom: Zoom,
 }
 
 impl Viewer {
     pub fn new(items: Vec<u32>, pos: usize) -> Self {
-        Self { items, pos, playback: None, place: None, error: None }
+        Self { items, pos, playback: None, place: None, error: None, zoom: Zoom::FIT }
     }
 
     fn go(&mut self, delta: isize) {
@@ -39,6 +71,7 @@ impl Viewer {
             self.pos = next;
             self.playback = None;
             self.error = None;
+            self.zoom = Zoom::FIT;
         }
     }
 
@@ -101,28 +134,102 @@ impl Viewer {
         let bottom_h = 64.0;
         let area = Rect::from_min_max(screen.min + vec2(0.0, top_h), screen.max - vec2(0.0, bottom_h)).shrink(6.0);
 
+        // Photos zoom in to their full resolution: scroll, pinch or +/-,
+        // double-click for 100%, drag to look around.
+        let zoomable = item.kind == Kind::Photo && self.playback.is_none();
+        if !zoomable {
+            self.zoom = Zoom::FIT;
+        }
+        let original =
+            if self.zoom.zoomed() { media.original(item, ctx.input(|i| i.max_texture_side) as u32) } else { None };
+        let ppp = ctx.pixels_per_point();
+        // Zoom that shows the photo at 100%, and the current percentage.
+        let mut actual_size = None;
+        let mut percent = None;
+
         // The image itself.
         let shown =
             self.playback.as_ref().and_then(|p| p.texture.clone()).or_else(|| full.clone()).or_else(|| thumb.clone());
         let mut shown_size = [item.width.max(1) as usize, item.height.max(1) as usize];
         if let Some(tex) = &shown {
             shown_size = tex.size();
-            let aspect = tex.size()[0] as f32 / tex.size()[1] as f32;
-            let mut size = area.size();
-            if size.x / size.y > aspect {
-                size.x = size.y * aspect;
+            let tex_size = vec2(tex.size()[0] as f32, tex.size()[1] as f32);
+            let aspect = tex_size.x / tex_size.y;
+            let mut fit = area.size();
+            if fit.x / fit.y > aspect {
+                fit.x = fit.y * aspect;
             } else {
-                size.y = size.x / aspect;
+                fit.y = fit.x / aspect;
             }
             // Don't blow small images up beyond 2x.
-            let natural = vec2(tex.size()[0] as f32, tex.size()[1] as f32) / ctx.pixels_per_point();
-            if full.is_some() && size.x > natural.x * 2.0 {
-                size = natural * 2.0;
+            let natural = tex_size / ppp;
+            if full.is_some() && fit.x > natural.x * 2.0 {
+                fit = natural * 2.0;
             }
-            let r = Rect::from_center_size(area.center(), size);
+            let pixels = original.as_ref().map(|t| t.size()[0] as f32).or(display_size(item).map(|s| s.x));
+            let pixels = pixels.unwrap_or(tex_size.x);
+            // Screen pixels per photo pixel, at scale 1.
+            let fit_px = fit.x * ppp / pixels;
+            if zoomable {
+                let one_to_one = if fit_px < 0.95 { 1.0 / fit_px } else { 2.0 };
+                let max_scale = (4.0 / fit_px).max(1.0);
+                actual_size = Some(one_to_one.min(max_scale));
+                let resp = ui.interact(area, ui.scope_id().with("photo"), Sense::click_and_drag());
+                let anchor = resp.hover_pos().unwrap_or(area.center());
+                let (scroll, pinch, zoom_in, zoom_out) = ui.input(|i| {
+                    let zoom_in = i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals);
+                    (i.smooth_scroll_delta.y, i.zoom_delta(), zoom_in, i.key_pressed(Key::Minus))
+                });
+                let mut factor = if resp.hovered() { (scroll / 180.0).exp2() * pinch } else { 1.0 };
+                factor *= if zoom_in {
+                    2.0
+                } else if zoom_out {
+                    0.5
+                } else {
+                    1.0
+                };
+                if (factor - 1.0).abs() > 1e-4 {
+                    self.zoom.zoom_about(area, anchor, (self.zoom.scale * factor).clamp(1.0, max_scale));
+                }
+                if resp.double_clicked() {
+                    if self.zoom.zoomed() {
+                        self.zoom = Zoom::FIT;
+                    } else {
+                        self.zoom.zoom_about(area, anchor, one_to_one.min(max_scale));
+                    }
+                }
+                if resp.dragged() {
+                    self.zoom.offset += resp.drag_delta();
+                }
+                if self.zoom.zoomed() {
+                    resp.on_hover_cursor(if ui.input(|i| i.pointer.primary_down()) {
+                        CursorIcon::Grabbing
+                    } else {
+                        CursorIcon::Grab
+                    });
+                }
+            }
+            let size = fit * self.zoom.scale;
+            self.zoom.clamp(area, size);
+            let px = fit_px * self.zoom.scale;
+            if self.zoom.zoomed() {
+                percent = Some(px * 100.0);
+            }
+            // Without mipmaps a texture can't be shrunk much more than 2x and
+            // stay smooth, so the screen-sized image is used until then.
+            let tex = match &original {
+                Some(o) if px >= 0.5 => o,
+                _ => tex,
+            };
+            let r = Rect::from_center_size(area.center() + self.zoom.offset, size);
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-            theme::frame(ui.painter(), r.expand(4.0), theme::BG_DARK);
-            ui.painter().image(tex.id(), r, uv, Color32::WHITE);
+            let painter = ui.painter().with_clip_rect(area.expand(6.0));
+            theme::frame(&painter, r.expand(4.0), theme::BG_DARK);
+            painter.image(tex.id(), r, uv, Color32::WHITE);
+            if self.zoom.zoomed() && px >= 0.5 && original.is_none() && !media.original_failed(item) {
+                let r = Rect::from_center_size(area.right_top() + vec2(-22.0, 22.0), vec2(20.0, 20.0));
+                ui.put(r, egui::Spinner::new().size(20.0).color(theme::MUTED));
+            }
         }
         if full.is_none() && !media.full_failed(item) {
             let r = Rect::from_center_size(area.center(), vec2(28.0, 28.0));
@@ -196,10 +303,14 @@ impl Viewer {
             FontId::proportional(12.0),
             theme::MUTED,
         );
+        let counter = format!("{} of {}", self.pos + 1, self.items.len());
         ui.painter().text(
             top.right_center() - vec2(16.0, 2.0),
             Align2::RIGHT_CENTER,
-            format!("{} of {}", self.pos + 1, self.items.len()),
+            match percent {
+                Some(p) => format!("{p:.0}%   ·   {counter}"),
+                None => counter,
+            },
             FontId::proportional(13.0),
             theme::MUTED,
         );
@@ -220,10 +331,8 @@ impl Viewer {
         if let Some(m) = &item.model {
             details.push(m.clone());
         }
-        if item.width > 0 {
-            // EXIF stores sensor dimensions; orientations 5–8 are rotated 90°.
-            let (w, h) = if item.orientation >= 5 { (item.height, item.width) } else { (item.width, item.height) };
-            details.push(format!("{w} × {h}"));
+        if let Some(s) = display_size(item) {
+            details.push(format!("{} × {}", s.x, s.y));
         }
         if let Some(d) = item.duration.filter(|_| item.kind == Kind::Video) {
             details.push(format_duration(d));
@@ -267,6 +376,18 @@ impl Viewer {
         if buttons.button("Show on Map").clicked() {
             action = Action::ShowOnMap(idx);
         }
+        if let Some(scale) = actual_size {
+            let label = if self.zoom.zoomed() { "Fit" } else { "Full size" };
+            let hint = "Double-click the photo, or scroll to zoom; drag to look around";
+            if buttons.button(label).on_hover_text(hint).clicked() {
+                if self.zoom.zoomed() {
+                    self.zoom = Zoom::FIT;
+                } else {
+                    self.zoom.zoom_about(area, area.center(), scale);
+                }
+                ctx.request_repaint();
+            }
+        }
         let mut toggle = ui.input(|i| i.key_pressed(Key::Space));
         let motion = match item.kind {
             Kind::Video => Some(item.path.as_path()),
@@ -288,16 +409,20 @@ impl Viewer {
                 if playing {
                     self.playback = None;
                 } else {
+                    self.zoom = Zoom::FIT;
                     self.play(item, path, shown_size, &ctx);
                 }
             }
         }
 
-        ui.input(|i| {
-            if i.key_pressed(Key::Escape) {
+        // Esc steps out of a zoom before it closes the viewer.
+        if ui.input(|i| i.key_pressed(Key::Escape)) {
+            if self.zoom.zoomed() {
+                self.zoom = Zoom::FIT;
+            } else {
                 action = Action::Close;
             }
-        });
+        }
         let (left_key, right_key) = ui.input(|i| (i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)));
         if left_key {
             self.go(-1);
@@ -307,6 +432,13 @@ impl Viewer {
         }
         action
     }
+}
+
+/// The photo's size in pixels as shown: EXIF stores sensor dimensions, and
+/// orientations 5–8 are rotated 90°.
+fn display_size(item: &Item) -> Option<Vec2> {
+    let (w, h) = (item.width as f32, item.height as f32);
+    (item.width > 0 && item.height > 0).then(|| if item.orientation >= 5 { vec2(h, w) } else { vec2(w, h) })
 }
 
 pub fn format_coords(lat: f64, lon: f64) -> String {
