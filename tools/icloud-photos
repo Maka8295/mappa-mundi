@@ -3,6 +3,7 @@
 
     icloud-photos login       sign in to iCloud (password + 2FA code), about every two months
     icloud-photos download    download everything not downloaded yet; safe to stop and re-run
+                              (--parallel 4 runs four downloads at once, then double-checks)
     icloud-photos verify      check the downloaded files and count them
     icloud-photos status      show settings and whether the login is still valid
 
@@ -16,6 +17,8 @@ Settings live in ~/.config/icloud-photos/config.json (written by `login`).
 """
 
 import argparse
+import collections
+import fcntl
 import json
 import os
 import queue
@@ -27,7 +30,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "icloud-photos" / "config.json"
@@ -80,8 +83,8 @@ def icloudpd():
     return exe
 
 
-def base_cmd(cfg):
-    return [icloudpd(), "--username", cfg["apple_id"], "--cookie-directory", str(COOKIES), *AUTH_FLAGS]
+def base_cmd(cfg, cookies=COOKIES):
+    return [icloudpd(), "--username", cfg["apple_id"], "--cookie-directory", str(cookies), *AUTH_FLAGS]
 
 
 # ---------------------------------------------------------------- login
@@ -158,10 +161,13 @@ class Pass:
             self.errors.append(line.strip())
 
 
-def run_logged(cmd, log, dest, echo=True):
+def run_logged(cmd, log, dest, echo=True, stop=None, live=None):
     """Runs icloudpd non-interactively, teeing its output to `log`, and kills
-    it if it stalls."""
+    it if it stalls or `stop` (a threading.Event) is set. `live`, if given,
+    collects the in-progress result so others can watch its counters."""
     result = Pass()
+    if live is not None:
+        live.append(result)
     log.write(f"\n$ {' '.join(cmd)}\n")
     log.flush()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -170,7 +176,7 @@ def run_logged(cmd, log, dest, echo=True):
     threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout] + [lines.put(None)], daemon=True).start()
 
     try:
-        watch(proc, lines, result, log, dest, echo)
+        watch(proc, lines, result, log, dest, echo, stop)
     finally:
         # icloudpd runs in its own process group (so a stall can kill all of
         # it); make sure Ctrl-C or an error here doesn't leave it running.
@@ -180,13 +186,18 @@ def run_logged(cmd, log, dest, echo=True):
     return result
 
 
-def watch(proc, lines, result, log, dest, echo):
-    last_activity = time.monotonic()
+def watch(proc, lines, result, log, dest, echo, stop):
+    last_activity = last_check = time.monotonic()
     part_sizes = {}
     while True:
+        if stop is not None and stop.is_set() and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
         try:
-            line = lines.get(timeout=60)
+            line = lines.get(timeout=5)
         except queue.Empty:
+            if time.monotonic() - last_check < 60:
+                continue
+            last_check = time.monotonic()
             # Quiet is fine while a large video is still growing.
             sizes = {p: p.stat().st_size for p in dest.rglob("*.part") if p.exists()}
             if sizes != part_sizes:
@@ -237,9 +248,16 @@ def cmd_download(args):
     dest = cfg["dest"]
     if not (dest / MARKER).exists():
         die(f"{dest} is not there (is its drive mounted?). To start a new library there, run:  icloud-photos login")
+    # Two downloads into one library would trip over each other's files.
+    lock = open(dest / ".icloud-photos.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        die("Another `icloud-photos download` is already running for this library.")
     logs = dest / ".icloud-photos-logs"
     logs.mkdir(exist_ok=True)
-    log_path = logs / f"{datetime.now():%Y-%m-%d_%H%M%S}.log"
+    stamp = f"{datetime.now():%Y-%m-%d_%H%M%S}"
+    log_path = logs / f"{stamp}.log"
 
     libs = libraries(cfg)
     targets = [(lib, dest if lib == "PrimarySync" else dest / "Shared Library", []) for lib in libs]
@@ -250,12 +268,133 @@ def cmd_download(args):
     print(f"Log: {log_path}\n")
 
     with open(log_path, "a") as log:
+        if args.parallel > 1:
+            download_parallel(cfg, targets, logs, stamp, dest, args.parallel)
+            print("Final pass: checking every photo in iCloud is on disk…")
         complete = download_media(cfg, targets, log, dest)
         if not args.no_sidecars:
             write_sidecars(cfg, targets, log, dest)
     if not complete:
         sys.exit(1)
+    if args.parallel > 1:
+        print()
+        sys.exit(0 if verify(cfg) else 1)
     print("Next: icloud-photos verify")
+
+
+def plan_windows(cfg, lib, folder, extra, chunks):
+    """One listing pass over the library to see which files are still
+    missing, split into date ranges holding about the same number each.
+    Returns [(first_day, last_day, files)], biggest first."""
+    cmd = [*base_cmd(cfg), *DOWNLOAD_FLAGS, "--log-level", "info", "--directory", str(folder),
+           "--library", lib, *extra, "--only-print-filenames"]
+    out = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    probe = Pass()
+    for line in out.stderr.splitlines():
+        probe.feed(line)
+    check_fatal(probe)
+    days = collections.Counter()
+    for line in out.stdout.splitlines():
+        m = re.search(r"/(\d{4})/(\d{2})/(\d{2})/[^/]+$", line.strip())
+        if m:
+            days[date(*map(int, m.groups()))] += 1
+    if not days:
+        return []
+    total, target = sum(days.values()), sum(days.values()) / chunks
+    windows, start, acc = [], None, 0
+    ordered = sorted(days)
+    for i, d in enumerate(ordered):
+        start = start or d
+        acc += days[d]
+        if acc >= target or i == len(ordered) - 1:
+            # Windows are contiguous, so a day with nothing missing still
+            # belongs to one of them.
+            end = ordered[i + 1] - timedelta(days=1) if i + 1 < len(ordered) else d
+            windows.append((start, end, acc))
+            start, acc = None, 0
+    assert sum(w[2] for w in windows) == total
+    return sorted(windows, key=lambda w: -w[2])
+
+
+def day_start(d):
+    """Midnight at the start of `d`, local time: icloudpd's date folders and
+    date filters both use the computer's time zone."""
+    return datetime.combine(d, dtime.min).astimezone().isoformat()
+
+
+def day_end(d):
+    return (datetime.combine(d + timedelta(days=1), dtime.min).astimezone() - timedelta(microseconds=1)).isoformat()
+
+
+def download_parallel(cfg, targets, logs, stamp, dest, workers):
+    """Runs `workers` icloudpd processes at once, each on its own date range,
+    each with its own copy of the login session and its own log."""
+    jobs = queue.Queue()
+    planned = 0
+    for lib, folder, extra in targets:
+        print(f"Planning {lib}: listing what's still missing (takes a few minutes)…", flush=True)
+        for w in plan_windows(cfg, lib, folder, extra, workers * 3):
+            jobs.put((lib, folder, extra, w))
+            planned += w[2]
+    if not planned:
+        print("Nothing left to download.\n")
+        return
+    n_jobs = jobs.qsize()
+    print(f"{planned:,} files to download in {n_jobs} date ranges, {workers} at a time.\n", flush=True)
+
+    stop = threading.Event()
+    live, fatal, done = [], [], []
+    lock = threading.Lock()
+
+    def worker(i):
+        cookies = COOKIES.parent / f"session-worker{i}"
+        shutil.rmtree(cookies, ignore_errors=True)
+        shutil.copytree(COOKIES, cookies)
+        cookies.chmod(0o700)
+        with open(logs / f"{stamp}-worker{i}.log", "a") as log:
+            while not stop.is_set():
+                try:
+                    lib, folder, extra, (first, last, n) = jobs.get_nowait()
+                except queue.Empty:
+                    return
+                cmd = [*base_cmd(cfg, cookies), *DOWNLOAD_FLAGS, "--log-level", "info", "--directory", str(folder),
+                       "--library", lib, *extra, "--skip-created-before", day_start(first),
+                       "--skip-created-after", day_end(last)]
+                p = run_logged(cmd, log, dest, echo=False, stop=stop, live=live)
+                with lock:
+                    done.append((first, last, n, p))
+                if p.need_login or p.web_access_off or p.throttled:
+                    with lock:
+                        fatal.append(p)
+                    stop.set()
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(workers)]
+    for t in threads:
+        t.start()
+    start = time.monotonic()
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(30)
+            got = sum(p.downloaded for p in live)
+            failed = sum(len(p.failed) for p in live)
+            mins = (time.monotonic() - start) / 60
+            print(f"  {datetime.now():%H:%M}  {got:,} / ~{planned:,} files  ({got / max(mins, 0.5):.0f}/min), "
+                  f"{len(done)}/{n_jobs} ranges done, {failed} failed", flush=True)
+    except KeyboardInterrupt:
+        stop.set()
+        for t in threads:
+            t.join(timeout=30)
+        raise
+    for t in threads:
+        t.join()
+    for i in range(workers):
+        shutil.rmtree(COOKIES.parent / f"session-worker{i}", ignore_errors=True)
+    if fatal:
+        check_fatal(fatal[0])
+    got = sum(p.downloaded for p in live)
+    failed = [f for p in live for f in p.failed]
+    print(f"Parallel downloads finished: {got:,} files in {(time.monotonic() - start) / 60:.0f} min, "
+          f"{len(failed)} failed (the final pass retries them).\n", flush=True)
 
 
 def check_fatal(p):
@@ -417,22 +556,55 @@ def probe_photo(path):
             size = f.seek(0, os.SEEK_END)
             if size == 0:
                 return "empty file"
-            if path.suffix.lower() in (".jpg", ".jpeg"):
+            # Go by content, not name: pictures saved from the web keep
+            # whatever extension they had, e.g. a WebP called .JPG.
+            if head[:2] == b"\xff\xd8":
                 # The end-of-image marker; some cameras append data after it.
                 f.seek(max(0, size - 65536))
-                if head[:2] != b"\xff\xd8" or b"\xff\xd9" not in f.read():
+                if b"\xff\xd9" not in f.read():
                     return "incomplete JPEG"
-            elif path.suffix.lower() in (".heic", ".heif"):
-                if head[4:8] != b"ftyp":
-                    return "not a HEIF file"
+            elif head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+                if int.from_bytes(head[4:8], "little") + 8 > size:
+                    return "incomplete WebP"
+            elif head[4:8] == b"ftyp":
                 return check_boxes(path)
+            elif path.suffix.lower() in (".jpg", ".jpeg", ".heic", ".heif", ".webp"):
+                return "not an image file"
     except OSError as e:
         return str(e)
     return None
 
 
 def cmd_verify(args):
-    cfg = load_config()
+    sys.exit(0 if verify(load_config()) else 1)
+
+
+def library_size(dest):
+    """How many photos and videos iCloud reported for the main library in the
+    most recent full (unfiltered) download pass."""
+    total = None
+    for log in sorted((dest / ".icloud-photos-logs").glob("*.log")):
+        cmd = ""
+        for line in open(log, errors="replace"):
+            if line.startswith("$ "):
+                cmd = line
+            m = re.search(r"Downloading (\d+) ", line)
+            if m and "--skip-created" not in cmd and "--album" not in cmd and "PrimarySync" in cmd:
+                total = int(m.group(1))
+    return total
+
+
+def item_key(p):
+    """Folder and name stem shared by all of one photo's files; the laptop-style
+    Live clip name IMG_1234_HEVC.MOV belongs to IMG_1234.HEIC."""
+    stem = p.stem.lower()
+    if p.suffix.lower() in VIDEO_EXT:
+        stem = stem.removesuffix("_hevc")
+    return p.parent, stem
+
+
+def verify(cfg):
+    """Checks every file; True if nothing is damaged or missing."""
     dest = cfg["dest"]
     if not dest.exists():
         die(f"{dest} does not exist yet. Run:  icloud-photos download")
@@ -450,8 +622,8 @@ def cmd_verify(args):
         elif ext in VIDEO_EXT:
             videos.append(p)
 
-    stems = {(p.parent, p.stem.lower()) for p in photos}
-    live = [v for v in videos if (v.parent, v.stem.lower()) in stems]
+    stems = {item_key(p) for p in photos}
+    live = [v for v in videos if item_key(v) in stems]
     edited = [p for p in photos + videos if p.stem.lower().endswith("-adjusted")]
     plain_videos = len(videos) - len(live)
 
@@ -476,14 +648,33 @@ def cmd_verify(args):
     print()
     print("Compare with the totals at the bottom of Photos → Library → All on your iPhone.")
     print("(The iPhone may count edits made in another format, e.g. a JPEG beside a HEIC, as one photo.)")
+    # Head count: every photo/video's files share one name stem (the id
+    # icloudpd adds makes it unique), so distinct stems = distinct items.
+    # Files copied in from elsewhere are listed in merged-*.tsv manifests
+    # and counted on their own.
+    merged = set()
+    for manifest in (dest / ".icloud-photos-logs").glob("merged-*.tsv"):
+        merged |= {Path(line.split("\t")[1]) for line in open(manifest) if not line.startswith("#")}
+    main = [p for p in photos + videos if p.relative_to(dest).parts[0] not in ("Shared Library", "Hidden")]
+    items = {item_key(p) for p in main if p not in merged and not p.stem.lower().endswith("-adjusted")}
+    expected = library_size(dest)
+    missing = expected is not None and len(items) < expected
+    if expected is not None:
+        print(f"\nIn iCloud: {expected:,} photos and videos.  On disk: {len(items):,}."
+              + ("  ✓" if not missing else f"  {expected - len(items):,} missing."))
+    if merged:
+        print(f"Plus {len({item_key(p) for p in merged}):,} photos and videos copied in from elsewhere (not in iCloud).")
+    ok = not (partial or problems or missing)
     if partial:
         print(f"\n{len(partial)} unfinished downloads (.part files); `icloud-photos download` resumes them.")
+    if missing:
+        print("Run `icloud-photos download` again to fetch the missing ones.")
     if problems:
         print(f"\n{len(problems)} damaged files. Delete them and run `icloud-photos download` to fetch them again:")
         for path, err in problems:
             print(f"  {path}: {err}")
-        sys.exit(1)
-    print("\nNo damaged files found.")
+    print("\nEverything checks out." if ok else "")
+    return ok
 
 
 # ---------------------------------------------------------------- status
@@ -515,6 +706,8 @@ def main():
     p = sub.add_parser("download", help="download everything new")
     p.add_argument("--hidden", action="store_true", help="also download the Hidden album (into Hidden/)")
     p.add_argument("--no-sidecars", action="store_true", help="skip the XMP sidecar pass")
+    p.add_argument("--parallel", type=int, default=1, metavar="N",
+                   help="run N downloads at once on separate date ranges, then a normal pass to double-check")
     p.set_defaults(func=cmd_download)
     sub.add_parser("verify", help="check the downloaded files").set_defaults(func=cmd_verify)
     sub.add_parser("status", help="show settings and login state").set_defaults(func=cmd_status)
