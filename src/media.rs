@@ -25,27 +25,33 @@ impl Job {
         Self { key: item.key, path, kind: item.kind, orientation: item.orientation, max_dim }
     }
 
-    fn run(self) -> (u64, Option<ColorImage>) {
+    /// Results are keyed by item and size, so one photo can be loaded at
+    /// several sizes at once.
+    fn run(self) -> (Key, Option<ColorImage>) {
         let src = imageio::Source { path: &self.path, kind: self.kind, orientation: self.orientation, key: self.key };
         let result = if self.max_dim == 0 { imageio::thumbnail(&src) } else { imageio::full(&src, self.max_dim) };
         match result {
             Ok(img) => {
                 let size = [img.width() as usize, img.height() as usize];
-                (self.key, Some(ColorImage::from_rgba_unmultiplied(size, img.as_raw())))
+                ((self.key, self.max_dim), Some(ColorImage::from_rgba_unmultiplied(size, img.as_raw())))
             }
             Err(e) => {
                 eprintln!("mappa-mundi: {}: {e:#}", self.path.display());
-                (self.key, None)
+                ((self.key, self.max_dim), None)
             }
         }
     }
 }
 
+/// Item key and long-edge limit (0 for a thumbnail).
+type Key = (u64, u32);
+
 pub struct Media {
-    thumbs: TextureCache<u64, Job>,
-    full: TextureCache<u64, Job>,
-    /// Images at their own size, for zooming in on the one being viewed.
-    original: TextureCache<u64, Job>,
+    thumbs: TextureCache<Key, Job>,
+    /// Images decoded at the size the viewer shows them.
+    full: TextureCache<Key, Job>,
+    /// Larger versions, up to the original size, for zooming in.
+    zoom: TextureCache<Key, Job>,
 }
 
 impl Media {
@@ -60,60 +66,59 @@ impl Media {
         Self {
             // ~800 thumbnails of 320x240 is roughly 250 MB of GPU memory.
             thumbs: start("thumb", (cores / 2).clamp(2, 8), 800),
-            full: start("full", 2, 6),
-            // A 12 MP photo is ~50 MB of GPU memory.
-            original: start("original", 1, 2),
+            full: start("full", 2, 8),
+            // A 12 MP photo is ~50 MB of GPU memory; this holds two photos'
+            // original and half-size versions.
+            zoom: start("zoom", 2, 4),
         }
     }
 
     pub fn begin_frame(&mut self, ctx: &egui::Context) {
         self.thumbs.begin_frame(ctx);
         self.full.begin_frame(ctx);
-        self.original.begin_frame(ctx);
+        self.zoom.begin_frame(ctx);
     }
 
     pub fn end_frame(&mut self) {
         self.thumbs.end_frame();
         self.full.end_frame();
-        self.original.end_frame();
+        self.zoom.end_frame();
     }
 
     pub fn thumb(&mut self, item: &Item, priority: f32) -> Option<TextureHandle> {
-        if let Some(t) = self.thumbs.get(&item.key) {
-            return Some(t.clone());
-        }
-        self.thumbs.request(item.key, priority, || Job::new(item, 0));
-        None
+        load(&mut self.thumbs, item, priority, 0)
     }
 
     pub fn thumb_failed(&self, item: &Item) -> bool {
-        self.thumbs.failed(&item.key)
+        self.thumbs.failed(&(item.key, 0))
     }
 
+    /// The image with its long edge scaled down to `max_dim` pixels.
     pub fn full(&mut self, item: &Item, priority: f32, max_dim: u32) -> Option<TextureHandle> {
-        if let Some(t) = self.full.get(&item.key) {
-            return Some(t.clone());
-        }
-        self.full.request(item.key, priority, || Job::new(item, max_dim));
-        None
+        load(&mut self.full, item, priority, max_dim)
     }
 
-    pub fn full_failed(&self, item: &Item) -> bool {
-        self.full.failed(&item.key)
+    pub fn full_failed(&self, item: &Item, max_dim: u32) -> bool {
+        self.full.failed(&(item.key, max_dim))
     }
 
-    /// The image without downscaling (up to `max_side`, the GPU's limit).
-    pub fn original(&mut self, item: &Item, max_side: u32) -> Option<TextureHandle> {
-        if let Some(t) = self.original.get(&item.key) {
-            return Some(t.clone());
-        }
-        self.original.request(item.key, 0.0, || Job::new(item, max_side));
-        None
+    /// Like `full`, for the bigger versions zooming in needs.
+    pub fn zoomed(&mut self, item: &Item, priority: f32, max_dim: u32) -> Option<TextureHandle> {
+        load(&mut self.zoom, item, priority, max_dim)
     }
 
-    pub fn original_failed(&self, item: &Item) -> bool {
-        self.original.failed(&item.key)
+    pub fn zoomed_failed(&self, item: &Item, max_dim: u32) -> bool {
+        self.zoom.failed(&(item.key, max_dim))
     }
+}
+
+fn load(cache: &mut TextureCache<Key, Job>, item: &Item, priority: f32, max_dim: u32) -> Option<TextureHandle> {
+    let key = (item.key, max_dim);
+    if let Some(t) = cache.get(&key) {
+        return Some(t.clone());
+    }
+    cache.request(key, priority, || Job::new(item, max_dim));
+    None
 }
 
 /// UV rectangle that centre-crops a texture to a square.

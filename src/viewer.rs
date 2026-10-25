@@ -57,11 +57,13 @@ pub struct Viewer {
     place: Option<(u32, String)>,
     error: Option<String>,
     zoom: Zoom,
+    /// The photo's version drawn last (item key, texture).
+    last: Option<(u64, TextureHandle)>,
 }
 
 impl Viewer {
     pub fn new(items: Vec<u32>, pos: usize) -> Self {
-        Self { items, pos, playback: None, place: None, error: None, zoom: Zoom::FIT }
+        Self { items, pos, playback: None, place: None, error: None, zoom: Zoom::FIT, last: None }
     }
 
     fn go(&mut self, delta: isize) {
@@ -97,17 +99,21 @@ impl Viewer {
         let screen = ui.max_rect();
         ui.painter().rect_filled(screen, 0.0, theme::BG_DARK);
 
-        // Long edge of the decoded full image, in physical pixels.
-        let max_dim =
-            ((screen.width().max(screen.height()) * ctx.pixels_per_point()) as u32 / 512 * 512).clamp(1024, 4096);
-        let full = media.full(item, 0.0, max_dim);
+        let top_h = 56.0;
+        let bottom_h = 64.0;
+        let area = Rect::from_min_max(screen.min + vec2(0.0, top_h), screen.max - vec2(0.0, bottom_h)).shrink(6.0);
+        let ppp = ctx.pixels_per_point();
+
+        // Each photo is decoded at the size it's shown, so it's drawn 1:1.
         let thumb = media.thumb(item, 0.0);
+        let fit_edge = decode_edge(item, thumb.as_ref(), area.size(), ppp);
+        let full = media.full(item, 0.0, fit_edge);
         for (i, d) in [1isize, -1, 2].into_iter().enumerate() {
             let j = self.pos as isize + d;
             if j >= 0 && (j as usize) < self.items.len() {
                 let other = &lib.items[self.items[j as usize] as usize];
-                media.full(other, 1.0 + i as f32, max_dim);
-                media.thumb(other, 1.0 + i as f32);
+                let other_thumb = media.thumb(other, 1.0 + i as f32);
+                media.full(other, 1.0 + i as f32, decode_edge(other, other_thumb.as_ref(), area.size(), ppp));
             }
         }
 
@@ -130,46 +136,56 @@ impl Viewer {
             self.playback = None;
         }
 
-        let top_h = 56.0;
-        let bottom_h = 64.0;
-        let area = Rect::from_min_max(screen.min + vec2(0.0, top_h), screen.max - vec2(0.0, bottom_h)).shrink(6.0);
-
         // Photos zoom in to their full resolution: scroll, pinch or +/-,
         // double-click for 100%, drag to look around.
         let zoomable = item.kind == Kind::Photo && self.playback.is_none();
         if !zoomable {
             self.zoom = Zoom::FIT;
         }
-        let original =
-            if self.zoom.zoomed() { media.original(item, ctx.input(|i| i.max_texture_side) as u32) } else { None };
-        let ppp = ctx.pixels_per_point();
+        // Zoomed in, a half-size version and the original load as well, so
+        // there's always one close to the size on screen: without mipmaps,
+        // the GPU loses detail shrinking an image much more than 2x.
+        let native = native_size(item, thumb.as_ref());
+        let max_side = ctx.input(|i| i.max_texture_side) as u32;
+        let (mut half, mut original, mut loading) = (None, None, false);
+        if self.zoom.zoomed() {
+            let half_edge = native.map(|n| (n.max_elem() / 2.0) as u32).filter(|&e| e as f32 > fit_edge as f32 * 1.2);
+            if let Some(e) = half_edge {
+                half = media.zoomed(item, 0.0, e);
+                loading |= half.is_none() && !media.zoomed_failed(item, e);
+            }
+            original = media.zoomed(item, 1.0, max_side);
+            loading |= original.is_none() && !media.zoomed_failed(item, max_side);
+        }
+        let mut versions: Vec<TextureHandle> =
+            [&original, &half, &full, &thumb].into_iter().flatten().cloned().collect();
+        // What was on screen for this photo before, e.g. at the old size
+        // while a resized window's version decodes.
+        if let Some((key, tex)) = &self.last
+            && *key == item.key
+        {
+            versions.push(tex.clone());
+        }
+        let playing = self.playback.as_ref().and_then(|p| p.texture.clone());
         // Zoom that shows the photo at 100%, and the current percentage.
         let mut actual_size = None;
         let mut percent = None;
+        let mut showing_thumb = false;
 
         // The image itself.
-        let shown =
-            self.playback.as_ref().and_then(|p| p.texture.clone()).or_else(|| full.clone()).or_else(|| thumb.clone());
         let mut shown_size = [item.width.max(1) as usize, item.height.max(1) as usize];
-        if let Some(tex) = &shown {
-            shown_size = tex.size();
-            let tex_size = vec2(tex.size()[0] as f32, tex.size()[1] as f32);
-            let aspect = tex_size.x / tex_size.y;
-            let mut fit = area.size();
-            if fit.x / fit.y > aspect {
-                fit.x = fit.y * aspect;
-            } else {
-                fit.y = fit.x / aspect;
-            }
+        if let Some(reference) = playing.as_ref().or(versions.first()) {
+            let ref_size = tex_size(reference);
+            let mut fit = fit_in(area.size(), ref_size.x / ref_size.y);
+            // Pixels across the photo itself, as far as is known yet.
+            let largest = versions.iter().map(tex_size).max_by(|a, b| a.x.total_cmp(&b.x)).unwrap_or(ref_size);
+            let pixels = original.as_ref().map(tex_size).or(native).unwrap_or(largest);
             // Don't blow small images up beyond 2x.
-            let natural = tex_size / ppp;
-            if full.is_some() && fit.x > natural.x * 2.0 {
-                fit = natural * 2.0;
+            if (native.is_some() || full.is_some()) && fit.x > pixels.x / ppp * 2.0 {
+                fit = pixels / ppp * 2.0;
             }
-            let pixels = original.as_ref().map(|t| t.size()[0] as f32).or(display_size(item).map(|s| s.x));
-            let pixels = pixels.unwrap_or(tex_size.x);
             // Screen pixels per photo pixel, at scale 1.
-            let fit_px = fit.x * ppp / pixels;
+            let fit_px = fit.x * ppp / pixels.x;
             if zoomable {
                 let one_to_one = if fit_px < 0.95 { 1.0 / fit_px } else { 2.0 };
                 let max_scale = (4.0 / fit_px).max(1.0);
@@ -211,30 +227,38 @@ impl Viewer {
             }
             let size = fit * self.zoom.scale;
             self.zoom.clamp(area, size);
-            let px = fit_px * self.zoom.scale;
             if self.zoom.zoomed() {
-                percent = Some(px * 100.0);
+                percent = Some(fit_px * self.zoom.scale * 100.0);
             }
-            // Without mipmaps a texture can't be shrunk much more than 2x and
-            // stay smooth, so the screen-sized image is used until then.
-            let tex = match &original {
-                Some(o) if px >= 0.5 => o,
-                _ => tex,
-            };
-            let r = Rect::from_center_size(area.center() + self.zoom.offset, size);
+            let screen_px = size.x * ppp;
+            let tex = playing.as_ref().unwrap_or_else(|| closest(&versions, screen_px));
+            shown_size = tex.size();
+            showing_thumb = thumb.as_ref().is_some_and(|t| t.id() == tex.id());
+            if playing.is_none() && !showing_thumb {
+                self.last = Some((item.key, tex.clone()));
+            }
+            let mut r = Rect::from_center_size(area.center() + self.zoom.offset, size);
+            // Shown whole, the version decoded for this size is drawn pixel
+            // for pixel: exactly its size, on the screen's pixel grid.
+            // Anything else makes the GPU blend neighbouring pixels.
+            if !self.zoom.zoomed() && (tex_size(tex).x - screen_px).abs() < screen_px * 0.03 {
+                let min = (r.center().to_vec2() * ppp - tex_size(tex) / 2.0).round() / ppp;
+                r = Rect::from_min_size(min.to_pos2(), tex_size(tex) / ppp);
+            }
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             let painter = ui.painter().with_clip_rect(area.expand(6.0));
             theme::frame(&painter, r.expand(4.0), theme::BG_DARK);
             painter.image(tex.id(), r, uv, Color32::WHITE);
-            if self.zoom.zoomed() && px >= 0.5 && original.is_none() && !media.original_failed(item) {
+            if self.zoom.zoomed() && loading && tex_size(tex).x < screen_px * 0.95 {
                 let r = Rect::from_center_size(area.right_top() + vec2(-22.0, 22.0), vec2(20.0, 20.0));
                 ui.put(r, egui::Spinner::new().size(20.0).color(theme::MUTED));
             }
         }
-        if full.is_none() && !media.full_failed(item) {
+        let decoding = full.is_none() && !media.full_failed(item, fit_edge);
+        if decoding && (versions.is_empty() || showing_thumb) {
             let r = Rect::from_center_size(area.center(), vec2(28.0, 28.0));
             ui.put(r, egui::Spinner::new().size(28.0).color(theme::MUTED));
-        } else if full.is_none() && thumb.is_none() {
+        } else if versions.is_empty() && playing.is_none() {
             ui.painter().text(
                 area.center(),
                 Align2::CENTER_CENTER,
@@ -432,6 +456,43 @@ impl Viewer {
         }
         action
     }
+}
+
+/// `aspect`-shaped size that fits in `area`.
+fn fit_in(area: Vec2, aspect: f32) -> Vec2 {
+    if area.x / area.y > aspect { vec2(area.y * aspect, area.y) } else { vec2(area.x, area.x / aspect) }
+}
+
+fn tex_size(t: &TextureHandle) -> Vec2 {
+    vec2(t.size()[0] as f32, t.size()[1] as f32)
+}
+
+/// The smallest version at least as wide as `px` (give or take 5%), or else
+/// the largest one there is.
+fn closest(versions: &[TextureHandle], px: f32) -> &TextureHandle {
+    let width = |t: &&TextureHandle| t.size()[0] as f32;
+    let by_width = |a: &&TextureHandle, b: &&TextureHandle| width(a).total_cmp(&width(b));
+    versions
+        .iter()
+        .filter(|t| width(t) >= px * 0.95)
+        .min_by(by_width)
+        .or_else(|| versions.iter().max_by(by_width))
+        .unwrap()
+}
+
+/// Long edge, in pixels, to decode `item` at so that it's drawn 1:1 when
+/// fitted into `area` (points).
+fn decode_edge(item: &Item, thumb: Option<&TextureHandle>, area: Vec2, ppp: f32) -> u32 {
+    let aspect = native_size(item, thumb).or(thumb.map(tex_size)).map(|s| s.x / s.y);
+    (aspect.map_or(area.max_elem(), |a| fit_in(area, a).max_elem()) * ppp).round() as u32
+}
+
+/// The photo's size in pixels, from its metadata. Not for edited photos: the
+/// metadata describes the original, and the edit may be cropped.
+fn native_size(item: &Item, thumb: Option<&TextureHandle>) -> Option<Vec2> {
+    let size = display_size(item).filter(|_| item.edited.is_none())?;
+    let agrees = |t: &TextureHandle| ((size.x / size.y) / (tex_size(t).x / tex_size(t).y) - 1.0).abs() < 0.02;
+    thumb.is_none_or(agrees).then_some(size)
 }
 
 /// The photo's size in pixels as shown: EXIF stores sensor dimensions, and

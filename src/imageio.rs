@@ -78,7 +78,8 @@ pub fn full(src: &Source, max_dim: u32) -> anyhow::Result<RgbaImage> {
     };
     Ok(if img.width().max(img.height()) > max_dim {
         let (w, h) = fit(img.width(), img.height(), max_dim);
-        image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle)
+        // Lanczos keeps fine detail crisp; the viewer shows this at 1:1.
+        image::imageops::resize(&img, w, h, image::imageops::FilterType::Lanczos3)
     } else {
         img
     })
