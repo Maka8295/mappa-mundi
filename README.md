@@ -16,6 +16,10 @@ street maps for the places you've been are downloaded once, ahead of time.
 |---|---|
 | ![The photos taken around St Mark's Square](docs/screenshots/places.webp) | ![A Live Photo of Santa Maria della Salute in the viewer](docs/screenshots/viewer.webp) |
 
+| Every photo by date | Zoom in to full resolution |
+|---|---|
+| ![The Venice trip in the timeline, newest first, grouped by day](docs/screenshots/timeline.webp) | ![The dome of Santa Maria della Salute at 100%](docs/screenshots/zoom.webp) |
+
 <sub>Photos: the author's iPhone 11 library. Map data © OpenStreetMap contributors and Natural Earth.</sub>
 
 ## Features
@@ -30,6 +34,10 @@ street maps for the places you've been are downloaded once, ahead of time.
 - **Markers like Apple's:** grouped photos show the newest photo plus a
   count. Click one to see the group in a grid, or double-click to zoom in
   until it splits.
+- **Timeline:** switch from **Map** to **Timeline** in the top bar to see
+  every photo and video by date, newest first, under month headings, with
+  each day's date and places above its photos. Photos without a location are
+  included. Jump to a year from the column on the right.
 - **Viewer:** zooms to full resolution (double-click for 100%, drag to look
   around), with date, place name, coordinates and camera model. Navigate with
   ←/→, play Live Photos and videos with Space (silent; **Open…** plays with
@@ -93,7 +101,8 @@ sed "s|^Exec=mappa-mundi|Exec=$HOME/.cargo/bin/mappa-mundi|" assets/mappa-mundi.
 | Zoom | Scroll wheel, pinch, double-click, `+`/`−` keys or buttons |
 | See the photos in a group | Click a marker |
 | Zoom into a group | Double-click a marker |
-| Open a photo | Click it in the side panel |
+| Browse by date | **Timeline** in the top bar; click a year on the right to jump to it |
+| Open a photo | Click it in the side panel or the timeline |
 | See a photo at full resolution | Double-click it (or **Full size**) for 100%; scroll, pinch or `+`/`−` to zoom; drag to look around |
 | Next / previous photo | `→` / `←` |
 | Play Live Photo / video | Space, or the **LIVE** / **Play** button |
@@ -302,6 +311,7 @@ cd .. && cargo run --release --example build_basemap -- ne-data assets/basemap.b
 | `src/video.rs` | ffmpeg poster frames and playback |
 | `src/cluster.rs` | Zoom-level marker grouping |
 | `src/viewer.rs` | Full-screen viewer |
+| `src/timeline.rs` | Photos by date |
 | `tools/build_basemap.rs` | Natural Earth → `assets/basemap.bin` |
 | `tools/icloud-photos` | iCloud download wrapper (Python, stdlib only) |
 | `tools/street-maps` | Street-map downloader (Python, stdlib only) |

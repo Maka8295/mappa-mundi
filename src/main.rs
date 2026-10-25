@@ -15,6 +15,7 @@ mod streets;
 mod texcache;
 mod theme;
 mod tiles;
+mod timeline;
 mod video;
 mod viewer;
 mod work;

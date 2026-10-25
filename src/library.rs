@@ -97,11 +97,18 @@ impl Item {
     pub fn taken_local(&self) -> Option<chrono::NaiveDateTime> {
         chrono::DateTime::from_timestamp(self.taken?, 0).map(|d| d.naive_utc())
     }
+
+    /// False for photos without GPS data; their coordinates are NaN.
+    pub fn has_location(&self) -> bool {
+        self.lat.is_finite()
+    }
 }
 
 pub struct Library {
-    /// Geotagged items only; the map has nowhere to put the rest.
+    /// Every photo and video: the `located` geotagged ones first (all the
+    /// map can show), then those without a location.
     pub items: Vec<Item>,
+    pub located: usize,
     pub photos: usize,
     pub videos: usize,
     pub live: usize,
@@ -263,7 +270,7 @@ fn build_library(files: &[Found], metas: Vec<Meta>, xmps: Vec<Option<Xmp>>) -> L
     }
     adopt_orphan_edits(&mut groups, &edited);
 
-    let mut lib = Library { items: Vec::new(), photos: 0, videos: 0, live: 0, without_location: 0 };
+    let mut lib = Library { items: Vec::new(), located: 0, photos: 0, videos: 0, live: 0, without_location: 0 };
     for idxs in groups.into_values() {
         let pick = |kind: Kind, want_edited: bool| -> Vec<usize> {
             let mut v: Vec<usize> =
@@ -296,11 +303,12 @@ fn build_library(files: &[Found], metas: Vec<Meta>, xmps: Vec<Option<Xmp>>) -> L
         let fallback = shown.map(|s| &metas[s]);
         let lat = xmp.and_then(|x| x.lat).or(m.lat).or(fallback.and_then(|f| f.lat));
         let lon = xmp.and_then(|x| x.lon).or(m.lon).or(fallback.and_then(|f| f.lon));
-        let (Some(lat), Some(lon)) = (lat, lon) else {
-            lib.without_location += 1;
-            continue;
-        };
-        let (x, y) = geo::to_merc(lat, lon);
+        // Photos without a location stay in the library (for the timeline),
+        // with NaN coordinates.
+        let location = lat.zip(lon);
+        lib.without_location += location.is_none() as usize;
+        let (lat, lon) = location.unwrap_or((f64::NAN, f64::NAN));
+        let (x, y) = if location.is_some() { geo::to_merc(lat, lon) } else { (f64::NAN, f64::NAN) };
         let image = shown.unwrap_or(primary);
         let (f, im) = (&files[image], &metas[image]);
         let key = fnv1a(&[f.path.as_os_str().as_encoded_bytes(), &f.size.to_le_bytes(), &f.mtime.to_le_bytes()]);
@@ -324,8 +332,12 @@ fn build_library(files: &[Found], metas: Vec<Meta>, xmps: Vec<Option<Xmp>>) -> L
             key,
         });
     }
-    // Newest first everywhere (cluster representatives, grids, viewer).
-    lib.items.sort_by(|a, b| b.taken.cmp(&a.taken).then_with(|| a.path.cmp(&b.path)));
+    // Located items first, for the map; each part newest first (cluster
+    // representatives, grids, viewer).
+    lib.items.sort_by(|a, b| {
+        (b.has_location().cmp(&a.has_location())).then(b.taken.cmp(&a.taken)).then_with(|| a.path.cmp(&b.path))
+    });
+    lib.located = lib.items.len() - lib.without_location;
     lib
 }
 
@@ -564,5 +576,22 @@ mod grouping_tests {
             assert_eq!((it.lat, it.lon, it.taken), (53.27, -9.05, Some(1_600_000_000)));
             assert!(it.favorite && it.caption.as_deref() == Some("Pier"));
         }
+    }
+
+    #[test]
+    fn items_without_location_come_last() {
+        let lib = build(
+            &["/l/new.PNG", "/l/old.HEIC", "/l/mid.HEIC"],
+            |n| match n {
+                "/l/new.PNG" => Meta { taken: Some(1_800_000_000), ..Default::default() },
+                "/l/old.HEIC" => Meta { taken: Some(1_600_000_000), ..here() },
+                _ => here(),
+            },
+            |_| None,
+        );
+        assert_eq!((lib.items.len(), lib.located, lib.without_location), (3, 2, 1));
+        let order: Vec<String> = lib.items.iter().map(Item::file_name).collect();
+        assert_eq!(order, ["mid.HEIC", "old.HEIC", "new.PNG"]);
+        assert!(!lib.items[2].has_location() && lib.items[2].x.is_nan());
     }
 }

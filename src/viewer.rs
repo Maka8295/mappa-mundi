@@ -344,14 +344,18 @@ impl Viewer {
         ui.painter().rect_filled(bottom, 0.0, theme::BG);
         theme::rule_h(ui.painter(), bottom.x_range(), bottom.top(), true);
         if self.place.as_ref().is_none_or(|(i, _)| *i != idx) {
-            self.place = Some((idx, crate::app::place_name(item.lat, item.lon)));
+            let place =
+                if item.has_location() { crate::app::place_name(item.lat, item.lon) } else { "No location".into() };
+            self.place = Some((idx, place));
         }
         let place = &self.place.as_ref().unwrap().1;
         let mut details = Vec::new();
         if let Some(c) = &item.caption {
             details.push(format!("“{c}”"));
         }
-        details.push(format_coords(item.lat, item.lon));
+        if item.has_location() {
+            details.push(format_coords(item.lat, item.lon));
+        }
         if let Some(m) = &item.model {
             details.push(m.clone());
         }
@@ -397,7 +401,7 @@ impl Viewer {
         if buttons.button("Open…").on_hover_text("Open in the default app (with sound)").clicked() {
             video::open_external(item.image_path());
         }
-        if buttons.button("Show on Map").clicked() {
+        if item.has_location() && buttons.button("Show on Map").clicked() {
             action = Action::ShowOnMap(idx);
         }
         if let Some(scale) = actual_size {

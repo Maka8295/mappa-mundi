@@ -14,6 +14,7 @@ use crate::map::{MapView, View};
 use crate::media::{self, Media};
 use crate::theme;
 use crate::tiles::TileLayer;
+use crate::timeline::Timeline;
 use crate::viewer::{self, Viewer};
 
 /// Marker edge length in points.
@@ -26,6 +27,9 @@ struct Config {
     root: Option<PathBuf>,
     tiles: Option<PathBuf>,
     view: Option<(f64, f64, f64)>,
+    /// Showing the timeline rather than the map.
+    #[serde(default)]
+    timeline: bool,
 }
 
 impl Config {
@@ -66,6 +70,8 @@ struct Selection {
 pub struct MappaMundiApp {
     config: Config,
     library: Option<Library>,
+    /// Built from the library the first time the timeline is shown.
+    timeline: Option<Timeline>,
     clusters: Option<Clusters>,
     scan: Option<Receiver<ScanMsg>>,
     progress: (usize, usize),
@@ -119,6 +125,7 @@ impl MappaMundiApp {
             map: MapView::new(view.unwrap_or(View { cx: 0.5, cy: 0.4, zoom: 1.5 })),
             fit_on_load: view.is_none(),
             library: None,
+            timeline: None,
             clusters: None,
             scan: None,
             progress: (0, 0),
@@ -155,7 +162,7 @@ impl MappaMundiApp {
                 };
                 let msg = match library::scan(&root, progress) {
                     Ok(lib) => {
-                        let clusters = Clusters::build(&lib.items, CLUSTER_RADIUS);
+                        let clusters = Clusters::build(&lib.items[..lib.located], CLUSTER_RADIUS);
                         ScanMsg::Done(Box::new((lib, clusters)))
                     }
                     Err(e) => ScanMsg::Failed(format!("{e:#}")),
@@ -179,6 +186,7 @@ impl MappaMundiApp {
                         // Item indices may have changed; drop anything referring to them.
                         self.selection = None;
                         self.viewer = None;
+                        self.timeline = None;
                         if self.fit_on_load {
                             self.fit_on_load = false;
                             self.show_all(ui, false);
@@ -199,6 +207,7 @@ impl MappaMundiApp {
                 self.config.root = Some(root.clone());
                 self.config.save();
                 self.library = None;
+                self.timeline = None;
                 self.clusters = None;
                 self.selection = None;
                 self.fit_on_load = true;
@@ -250,7 +259,7 @@ impl MappaMundiApp {
 
     fn show_all(&mut self, ui: &Ui, animate: bool) {
         let Some(lib) = &self.library else { return };
-        let Some(b) = bounds(lib.items.iter()) else { return };
+        let Some(b) = bounds(lib.items[..lib.located].iter()) else { return };
         let rect = ui.ctx().content_rect();
         let view = MapView::fit(rect, b, 70.0, 15.0);
         if animate {
@@ -265,6 +274,14 @@ impl MappaMundiApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.label(RichText::new("Mappa Mundi").font(theme::blackletter(24.0)).color(theme::BRASS));
+            ui.separator();
+            for (timeline, label, hint) in [(false, "Map", "Where they were taken"), (true, "Timeline", "By date")] {
+                let selected = self.config.timeline == timeline;
+                let text = if selected { RichText::new(label) } else { RichText::new(label).color(theme::FG) };
+                if ui.add(egui::Button::new(text).selected(selected)).on_hover_text(hint).clicked() {
+                    self.config.timeline = timeline;
+                }
+            }
             ui.separator();
             if ui.button("Open Folder…").clicked() {
                 self.choose_folder(ui.ctx());
@@ -289,11 +306,16 @@ impl MappaMundiApp {
                     };
                     ui.add(egui::ProgressBar::new(frac).desired_width(220.0).text(text));
                     ui.spinner();
+                } else if let Some(lib) = &self.library
+                    && self.config.timeline
+                {
+                    let s = format!("{} photos  ·  {} videos", group(lib.photos), group(lib.videos));
+                    ui.add(egui::Label::new(RichText::new(s).weak()).truncate());
                 } else if let Some(lib) = &self.library {
-                    if !lib.items.is_empty() && ui.button("Show All").clicked() {
+                    if lib.located > 0 && ui.button("Show All").clicked() {
                         show_all = true;
                     }
-                    let mut s = format!("{} on map", group(lib.items.len()));
+                    let mut s = format!("{} on map", group(lib.located));
                     if lib.live > 0 {
                         s += &format!("  ·  {} Live", group(lib.live));
                     }
@@ -390,13 +412,27 @@ impl MappaMundiApp {
         self.empty_state(ui, rect);
     }
 
+    fn timeline_ui(&mut self, ui: &mut Ui) {
+        let Some(lib) = &self.library else {
+            ui.painter().rect_filled(ui.max_rect(), 0.0, theme::BG_DARK);
+            if self.scan.is_none() {
+                self.empty_state(ui, ui.max_rect());
+            }
+            return;
+        };
+        let timeline = self.timeline.get_or_insert_with(|| Timeline::new(lib));
+        if let Some(n) = timeline.ui(ui, lib, &mut self.media) {
+            self.viewer = Some(Viewer::new(timeline.order.clone(), n));
+        }
+    }
+
     /// Centred card for errors, the first run, and libraries without GPS data.
     fn empty_state(&mut self, ui: &mut Ui, rect: Rect) {
         let (text, open_button) = if let Some(m) = &self.message {
             (m.clone(), false)
         } else if self.config.root.is_none() {
             ("Choose the folder with your iPhone photos\nto see where they were taken.".into(), true)
-        } else if self.scan.is_none() && self.library.as_ref().is_some_and(|l| l.items.is_empty()) {
+        } else if self.scan.is_none() && self.library.as_ref().is_some_and(|l| l.located == 0) {
             ("None of the photos in this folder have location data.".into(), true)
         } else {
             return;
@@ -486,7 +522,7 @@ impl MappaMundiApp {
         };
         self.selection = Some(Selection {
             members: cl.members.clone(),
-            title: describe_places(&items),
+            title: describe_places(&items, 400),
             subtitle: [counts.join(", "), dates]
                 .into_iter()
                 .filter(|s| !s.is_empty())
@@ -617,7 +653,7 @@ fn paint_marker(
     }
 }
 
-fn paint_tile(ui: &Ui, r: Rect, tex: Option<&egui::TextureHandle>, item: &Item, hovered: bool) {
+pub(crate) fn paint_tile(ui: &Ui, r: Rect, tex: Option<&egui::TextureHandle>, item: &Item, hovered: bool) {
     let p = ui.painter();
     match tex {
         Some(t) => {
@@ -696,10 +732,10 @@ pub fn place_name(lat: f64, lon: f64) -> String {
 }
 
 /// Title for a group of photos: the place they were taken, or the most
-/// common few ("London, Paris & 2 more") when they span several.
-fn describe_places(items: &[&Item]) -> String {
-    const SAMPLE: usize = 400;
-    let step = items.len().div_ceil(SAMPLE).max(1);
+/// common few ("London, Paris & 2 more") when they span several. Looks at
+/// up to `sample` of them.
+pub(crate) fn describe_places(items: &[&Item], sample: usize) -> String {
+    let step = items.len().div_ceil(sample).max(1);
     let mut counts: Vec<(String, usize)> = Vec::new();
     for it in items.iter().step_by(step) {
         let name = match basemap::get().nearest_city(it.lat, it.lon) {
@@ -722,7 +758,7 @@ fn describe_places(items: &[&Item]) -> String {
 }
 
 /// 1234567 → "1,234,567".
-fn group(n: usize) -> String {
+pub(crate) fn group(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -767,6 +803,7 @@ impl eframe::App for MappaMundiApp {
                     let item = &lib.items[idx as usize];
                     let to = View { cx: item.x, cy: item.y, zoom: self.map.view.zoom.max(14.0) };
                     self.viewer = None;
+                    self.config.timeline = false;
                     self.map.fly_to(ui, to);
                 }
             }
@@ -776,10 +813,14 @@ impl eframe::App for MappaMundiApp {
             let top = egui::Panel::top("top").frame(frame).show_separator_line(false).show(ui, |ui| self.top_bar(ui));
             let r = top.response.rect;
             theme::rule_h(ui.painter(), r.x_range(), r.bottom(), false);
-            self.selection_panel(ui);
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.map_ui(ui));
-            if self.selection.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.selection = None;
+            if self.config.timeline {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.timeline_ui(ui));
+            } else {
+                self.selection_panel(ui);
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.map_ui(ui));
+                if self.selection.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.selection = None;
+                }
             }
         }
 
